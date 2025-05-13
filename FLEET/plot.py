@@ -1,146 +1,131 @@
-from matplotlib.ticker import ScalarFormatter
-from FLEET.catalog import get_kron_and_psf
-from astropy.coordinates import SkyCoord
-from astropy.coordinates import Distance
-from FLEET.lightcurve import linex
+from .model import linex, model_mag, filter_colors, ztf_refs, lsst_refs
+from .catalog import sdss_refs, psst_refs, calc_separations
+import glob
+from astropy import table
+from matplotlib.pyplot import cm
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_sun
 import matplotlib.pyplot as plt
-from matplotlib import gridspec
 import matplotlib.dates as md
 from astropy.time import Time
 from bs4 import BeautifulSoup
 from PyAstronomy import pyasl
-from astropy import table
-from astral import Astral
 from io import BytesIO
 from PIL import Image
 import numpy as np
-import warnings
 import datetime
 import requests
 import urllib
 import ephem
-import glob
-import sys
 import os
+from astropy import units as u
+from astropy.cosmology import Planck18 as cosmo
+plt.rcParams.update({'font.size': 11})
+plt.rcParams.update({'font.family': 'serif'})
 
-def redshift_magnitude(magnitude, redshift, sigma = 0):
+
+def calc_absmag(obsmag, redshift, k_correct=True):
     """
-    This function will calculate the absolute magnitude of an object 
-    given it's apparent magntiude and redshift. Taken from 
-    http://www.astro.ufl.edu/~guzman/ast7939/projects/project01.html
-    And not applying a K, extinction, nor color correction.
+    Calculate the absolute magnitude for a given redshift.
 
     Parameters
-    ---------------
-    magnitude : Apparent magnitude of the source
-    redshift  : Redshift of the source
-    sigma     : Errorbar on the redshift
+    ----------
+    obsmag : float
+        Observed magnitude
+    redshift : float
+        Redshift of the object
+    k_correct : bool, default True
+        If True, apply a k-correction to the magnitude
 
-    Output
-    ---------------
-    Absolute Magnitude
+    Returns
+    -------
+    absmag : float
+        Absolute magnitude
     """
 
-    # Luminosity Distance in parsecs 
-    D_L = Distance(z = redshift).pc
+    # Calculate distance modulus
+    DL = cosmo.luminosity_distance(redshift).to(u.pc).value
+    DM = 5 * np.log10(DL / 10)
 
-    # Distance Modulus
-    DM = 5 * np.log10(D_L / 10)
-
-    # Absolute Magnitude
-    M = magnitude - DM
-
-    if sigma == 0:
-        return M, ''
+    # Apply k-correction
+    if k_correct:
+        kcorr = 2.5 * np.log10(1 + redshift)
     else:
-        D_Lplus = Distance(z = redshift + sigma).pc
-        if redshift - sigma >= 0:
-            D_Lminus = Distance(z = redshift - sigma).pc
-        else:
-            D_Lminus = Distance(z = 0).pc
+        kcorr = 0
 
-        DMplus = 5 * np.log10(D_Lplus / 10)
-        DMminus = 5 * np.log10(D_Lminus / 10)
+    # Calculate absolute magnitude
+    absmag = obsmag - DM + kcorr
 
-        Mplus = DMplus - DM
-        Mminus = DM - DMminus
+    return absmag
 
-        error = np.abs(0.5 * (Mplus + Mminus))
 
-    return M, error
+def plot_colors(bands):
+    """
+    Assign matplotlib colors to a given band or list of bands. If a filter
+    is not known, the color will be black.
 
-def plot_colors(all_bands):
-    '''
-    Generate a list of matplotlib readable colors based on
-    the input bands. Set the color to black if the filter
-    is not found.
-    '''
+    Parameters
+    ----------
+    bands : str or list of str
+        Name of filter(s).
 
-    # Make Color Array
-    all_colors = np.copy(all_bands.astype('S16')).astype('str')
-    #emptys = ['',' ','None','--', '-', b'',b' ',b'None',b'--', b'-', None, np.nan, 'nan', b'nan', '0', np.inf, 'inf']
+    Returns
+    -------
+    colors : str or list of str
+        Matplotlib color(s) for the given band(s).
+    """
 
-    # Select region for each filter
-    u_colors      = ((all_colors == "u") | (all_colors == "u'") | (all_colors == "U"))
-    g_colors      = ((all_colors == "g") | (all_colors == "g'"))
-    r_colors      = ((all_colors == 'r') | (all_colors == "r'") | (all_colors == 'R') | (all_colors == 'Rs'))
-    i_colors      = ((all_colors == 'i') | (all_colors == "i'") | (all_colors == 'I'))
-    z_colors      = ((all_colors == "z") | (all_colors == "z'")) 
-    V_colors      =  all_colors  == 'V'     
-    B_colors      =  all_colors  == 'B'     
-    C_colors      =  all_colors  == 'C'     
-    w_colors      =  all_colors  == 'w'     
-    G_colors      =  all_colors  == 'G'     
-    orange_colors =  all_colors  == 'orange'
-    cyan_colors   =  all_colors  == 'cyan'  
-    Clear_colors  =  all_colors  == 'Clear' 
-    UVM2_colors   = ((all_colors == "UVM2") | (all_colors == "M2"))
-    UVW1_colors   = ((all_colors == "UVW1") | (all_colors == "W1"))
-    UVW2_colors   = ((all_colors == "UVW2") | (all_colors == "W2"))
-    F475W_colors  =  all_colors  == 'F475W'
-    F625W_colors  =  all_colors  == 'F625W'
-    F775W_colors  =  all_colors  == 'F775W'
-    H_colors      =  all_colors  == 'H'
-    J_colors      =  all_colors  == 'J'
-    K_colors      = ((all_colors == "K") | (all_colors == "Ks"))
-    #nan_colors    =  np.array([i in emptys for i in all_colors])
+    # Assign matplotlib colors to Swift bands
+    colors_UVOT = cm.rainbow(np.linspace(0, 1, 7))
 
-    # Data that doesn't fall under any other filter
-    k_colors = ((u_colors+g_colors+r_colors+i_colors+z_colors+V_colors+B_colors+C_colors+w_colors+G_colors+orange_colors+cyan_colors+Clear_colors+UVM2_colors+UVW1_colors+UVW2_colors+F475W_colors+F625W_colors+F775W_colors+H_colors+J_colors+K_colors) == False)
+    # Create a dictionary mapping bands to colors
+    band_color_map = {
+        "u": 'navy', "u'": 'navy', "U": 'navy',
+        "g": 'g', "g'": 'g',
+        'r': 'r', "r'": 'r', 'R': 'r', 'Rs': 'r',
+        'i': 'maroon', "i'": 'maroon', 'I': 'maroon',
+        "z": 'saddlebrown', "z'": 'saddlebrown',
+        'V': 'lawngreen',
+        'B': 'darkcyan',
+        'C': 'c',
+        'w': 'goldenrod',
+        'G': 'orange',
+        'W1': 'deeppink',
+        'W2': 'tomato',
+        'orange': 'gold',
+        'cyan': 'blue',
+        'Clear': 'magenta',
+        'UVM2': colors_UVOT[0],
+        'UVW1': colors_UVOT[1],
+        'UVW2': colors_UVOT[2],
+        'F475W': 'lightsteelblue',
+        'F625W': 'slategray',
+        'F775W': 'tan',
+        'F850LP': 'gray',
+        'H': 'hotpink',
+        'J': 'mediumvioletred',
+        'K': 'palevioletred', "Ks": 'palevioletred',
+        'Y': 'indigo', "y": 'indigo',
+        'v': 'aquamarine',
+        'F062': '#003366',
+        'F087': '#0077BB',
+        'F106': '#99DDFF',
+        'F129': '#44BB99',
+        'F158': '#EEDD88',
+        'F184': '#EE8866',
+        'F213': '#B704C2',
+        'F146': '#994455'
+    }
 
-    # Change Filters to Python colors
-    all_colors[u_colors     ] = 'navy'
-    all_colors[g_colors     ] = 'g'
-    all_colors[r_colors     ] = 'r'
-    all_colors[i_colors     ] = 'maroon'
-    all_colors[z_colors     ] = 'saddlebrown'
-    all_colors[V_colors     ] = 'lawngreen'
-    all_colors[B_colors     ] = 'darkcyan'
-    all_colors[C_colors     ] = 'c'
-    all_colors[w_colors     ] = 'goldenrod'
-    all_colors[G_colors     ] = 'orange'
-    all_colors[orange_colors] = 'gold'
-    all_colors[cyan_colors  ] = 'blue'
-    all_colors[Clear_colors ] = 'magenta'
-    all_colors[UVM2_colors  ] = 'darkorchid'
-    all_colors[UVW1_colors  ] = 'cornflowerblue'
-    all_colors[UVW2_colors  ] = 'deepskyblue'
-    all_colors[F475W_colors ] = 'k'
-    all_colors[F625W_colors ] = 'slategray'
-    all_colors[F775W_colors ] = 'tan'
-    all_colors[H_colors     ] = 'hotpink'
-    all_colors[J_colors     ] = 'mediumvioletred'
-    all_colors[K_colors     ] = 'palevioletred'
-    all_colors[k_colors     ] = 'k'
+    # If input is a single band, return its color
+    if isinstance(bands, str):
+        return band_color_map.get(bands, 'k')
 
-    colors = np.array(np.ndarray.tolist(all_colors))
+    # If input is a list of bands, return a list of colors
+    return np.array([band_color_map.get(band, 'k') for band in bands])
 
-    return colors
 
-flot = lambda x : np.array(x).astype(float) 
-
-def plot_1a(time, y_0 = 0.95717, m = 0.01817, t_0 = 4.63783, g_0 = -0.91248, sigma_0 = 11.18299, tau = -17.77671, theta_0 = 19.384):
-    '''
+def plot_1a(time, y_0=0.92540, m=0.0182386, t_0=3.95539, g_0=-0.884576, sigma_0=11.0422, tau=-17.5522, theta_0=18.7745):
+    """
     Generate a type 1a supernova light curve from an analytical function:
     Slope + Gaussian + Exponential Rise
     As described in https://arxiv.org/pdf/1707.07614.pdf
@@ -150,799 +135,159 @@ def plot_1a(time, y_0 = 0.95717, m = 0.01817, t_0 = 4.63783, g_0 = -0.91248, sig
     i_model = plot_1a(timex, 0.79161, 0.0179976,  7.63109, -0.723820, 11.3517, -16.4830, 18.0652)
 
     Parameters
-    --------------
-    time    : Array of times
-    y_0     : Magntiude offset
-    m       : Slope of late time decay
-    t_0     : Time of maximum for gaussian
-    g_0     : Height of gaussian
-    sigma_0 : Width of gaussian
-    tau     : Explosion time
-    theta_0 : Rate of exponential rise
+    ----------
+    time : array-like
+        Time array for the light curve
+    y_0 : float, default 0.92540
+        Magnitude offset
+    m : float, default 0.0182386
+        Slope of late time decay
+    t_0 : float, default 3.95539
+        Time of maximum for gaussian
+    g_0 : float, default -0.884576
+        Height of gaussian
+    sigma_0 : float, default 11.0422
+        Width of gaussian
+    tau : float, default -17.5522
+        Explosion time
+    theta_0 : float, default 18.7745
+        Rate of exponential rise
 
-    Output
-    --------------
-    Magnitudes of supernova light curve
-    '''
+    Returns
+    -------
+    time : array-like
+        Time array adjusted to the light curve
+    magnitude : array-like
+        Magnitude array of the light curve
+    """
 
     # Components
-    slope       = y_0 + m * (time - t_0)
-    gaussian    = g_0 * np.exp(-(time - t_0) ** 2 / (2 * sigma_0 ** 2))
+    slope = y_0 + m * (time - t_0)
+    gaussian = g_0 * np.exp(-(time - t_0) ** 2 / (2 * sigma_0 ** 2))
     exponential = 1 - np.exp((tau - time) / theta_0)
 
     # Result
     magnitude = (slope + gaussian) / exponential
     return time - time[np.argmin(magnitude)], magnitude - magnitude[np.argmin(magnitude)]
 
+
 # Model Type Ia
-time_1a_model_r, magnitude_1a_model_r = plot_1a(np.linspace(-15, 120, 500), 0.92540, 0.0182386,  3.95539, -0.884576, 11.0422, -17.5522, 18.7745)
+time_1a_model_r = np.linspace(-15, 120, 500)
+phase_1a_model_r, magnitude_1a_model_r = plot_1a(time_1a_model_r)
 
-def quick_plot(object_name, object_class, ra_deg, dec_deg, output_table, first_mjd, bright_mjd, g_correct = 0, r_correct = 0, red_amplitude = np.nan, red_amplitude2 = np.nan, red_offset = np.nan, red_magnitude = np.nan, green_amplitude = np.nan, green_amplitude2 = np.nan, green_offset = np.nan, green_magnitude = np.nan, chi2 = np.nan, full_range = False):
-    '''
-    Create a diagnosis plot with the light curve and field image of a transient
-    Parameters
-    ---------------
-    object_name      : Name of the transient
-    ra_deg, dec_deg  : Coordiantes of the transient in degrees
-    output_table     : Data with photometry
-    first_mjd        : First MJD in either g or r from fit_linex()
-    bright_mjd       : Brightest MJD in either g or r from fit_linex()
-    g_correct        : extinction value in g band
-    r_correct        : extinction value in r band
 
-    red_amplitude    : Parameters from fit_linex()
-    red_amplitude2   :
-    red_offset       :
-    red_magnitude    :
-    green_amplitude  :
-    green_amplitude2 :
-    green_offset     :
-    green_magnitude  :
-    chi2             :
-
-    full_range       : Plot the entire photometry (True), or just
-                       the relevant portion (False)
-    
-    Output
-    ---------------
-    Saves an output to plots/ directory
-    '''
-
-    # Correct for extinction
-    output_table_correct = extinct(output_table, g_correct, r_correct)
-
-    # Create folder to store images, if it doesn't exist
-    if len(glob.glob('plots')) == 0:
-        os.system("mkdir plots")
-
-    # Plot Lightcurve
-    #plot_lightcurve(1, 1, 1, output_table_correct, first_mjd, bright_mjd, full_range = full_range, red_amplitude = red_amplitude, red_amplitude2 = red_amplitude2, red_offset = red_offset, red_magnitude = red_magnitude, green_amplitude = green_amplitude, green_amplitude2 = green_amplitude2, green_offset = green_offset, green_magnitude = green_magnitude, chi2 = chi2)
-
-    #plt.savefig('plots/%s_quick.pdf'%object_name, bbox_inches = 'tight')
-    #plt.clf(); plt.close('all')
-    
-    fig = plt.figure(figsize = (8, 7))
-    plt.subplots_adjust(hspace = 0.2)
-
-    # Plot Lightcurve
-    plot_lightcurve(2, 1, 1, output_table_correct, first_mjd, bright_mjd, full_range = False, red_amplitude = red_amplitude, 
-                    red_amplitude2 = red_amplitude2, red_offset = red_offset, red_magnitude = red_magnitude, green_amplitude = green_amplitude, 
-                    green_amplitude2 = green_amplitude2, green_offset = green_offset, green_magnitude = green_magnitude)
-    plt.title(object_name + ' - ' + object_class)
-    plt.xlim(xmax = 100)
-
-    plot_lightcurve(2, 1, 2, output_table_correct, first_mjd, bright_mjd, full_range = True, red_amplitude = red_amplitude, 
-                    red_amplitude2 = red_amplitude2, red_offset = red_offset, red_magnitude = red_magnitude, green_amplitude = green_amplitude, 
-                    green_amplitude2 = green_amplitude2, green_offset = green_offset, green_magnitude = green_magnitude)
-    plt.savefig('plots/%s_quick.pdf'%object_name, bbox_inches = 'tight')
-    plt.clf(); plt.close('all')
-
-def plot_lightcurve(sub_y, sub_x, sub_n, output_table, first_mjd, bright_mjd, red_amplitude = np.nan, red_amplitude2 = np.nan, red_offset = np.nan, red_magnitude = np.nan, green_amplitude = np.nan, green_amplitude2 = np.nan, green_offset = np.nan, green_magnitude = np.nan, chi2 = np.nan, subtract_phase = 0, add_phase = 0, plot_model = True, full_range = False, plot_comparison = True):
-    '''
-    Plot the light curve and model for a given transient
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n  : Subplot parameters (rows, columns, plot number)
-    output_table     : Data with photometry
-    bright_mjd       : Brightest MJD in either g or r from fit_linex()
-    first_mjd        : First MJD in either g or r from fit_linex()
-
-    red_amplitude    : Parameters from fit_linex()
-    red_amplitude2   :
-    red_offset       :
-    red_magnitude    :
-    green_amplitude  :
-    green_amplitude2 :
-    green_offset     :
-    green_magnitude  :
-    chi2             :
-
-    subtract_phase   : Days to subtract from minimum x limit
-    add_phase        : Days to add to maximum x limit
-    plot_model       : Plot the model
-    full_range       : Plot the entire photometry (True), or just
-                       the relevant portion (False)
-    plot_comparison  : Plot a Ia light curve?
-    '''
-
-    # Extract all data
-    all_magnitudes  =     flot(output_table['Mag'      ])
-    all_times       =     flot(output_table['MJD'      ])
-    all_sigmas      =     flot(output_table['MagErr'   ])
-    all_filters     = np.array(output_table['Filter'   ]).astype('str')
-    all_sources     = np.array(output_table['Source'   ]).astype('str')
-    all_upperlimits = np.array(output_table['UL'       ]).astype('str')
-    all_ignores     = np.array(output_table['Ignore'   ]).astype('str')
-    if full_range:
-        all_phases  = all_times
-    else:
-        all_phases  = all_times - bright_mjd
-
-    # Which are Upper limits and ignored data
-    upper_limit   = np.where((all_upperlimits == 'True' ) & (all_ignores == 'False'))[0]
-    detection     = np.where((all_upperlimits == 'False') & (all_ignores == 'False'))[0]
-    # Ignored
-    upper_ignore  = np.where((all_upperlimits == 'True' ) & (all_ignores == 'True'))[0]
-    detect_ignore = np.where((all_upperlimits == 'False') & (all_ignores == 'True'))[0]
-
-    # Select Plot Colors
-    all_colors = plot_colors(all_filters)
-
-    # Select groups of Data (detectiond and upper limits)
-    is_det_ZTF   = np.where(all_sources[detection] == 'ZTF')[0]
-    is_det_Local  = np.where(all_sources[detection] == 'Local')[0]
-    is_det_other = np.where([i not in ['ZTF', 'Local'] for i in all_sources[detection]])[0]
-
-    # Set Magnitude Limits to ± 0.5 the limits
-    real_magnitudes = all_magnitudes[np.isfinite(all_magnitudes)]
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.gca().invert_yaxis()
-    plt.ylim(np.nanmax(real_magnitudes) + 0.5, np.nanmin(real_magnitudes) - 0.5)
-
-    # Set Phase Limits
-    # Minimum
-    brightest_phase = bright_mjd - first_mjd
-    if brightest_phase > 100:
-        MJD_minimum = bright_mjd - 100
-    else:
-        MJD_minimum  = first_mjd - 5
-    phase_minimum  = MJD_minimum - bright_mjd
-
-    # Maximum
-    latest_phase = np.nanmax(all_phases[detection])
-    latest_mjd   = np.nanmax(all_times[detection])
-    if latest_phase >= 30:
-        MJD_maximum = latest_mjd + 5
-    else:
-        MJD_maximum = latest_mjd + 35
-    phase_maximum  = MJD_maximum - bright_mjd
-
-    # Include offsets if specified
-    if full_range:
-        mino, maxo = np.nanmin(all_times), np.nanmax(all_times)
-    else:
-        mino, maxo = phase_minimum - subtract_phase, phase_maximum + add_phase
-    # Making sure the min and max are not the same, otherwise who cares
-    if mino != maxo:
-        plt.xlim(mino, maxo)
-
-    # Plot Data (detections)
-    plt.errorbar(all_phases[detection][is_det_ZTF]  , all_magnitudes[detection][is_det_ZTF]  , all_sigmas[detection][is_det_ZTF]     , ecolor = all_colors[detection][is_det_ZTF].astype('str')  ,     fmt = 'd'   , alpha = 0.8, ms = 0)
-    plt.errorbar(all_phases[detection][is_det_Local] , all_magnitudes[detection][is_det_Local] , all_sigmas[detection][is_det_Local] , ecolor = all_colors[detection][is_det_Local].astype('str') ,     fmt = '*'   , alpha = 0.8, ms = 0)
-    plt.errorbar(all_phases[detection][is_det_other], all_magnitudes[detection][is_det_other], all_sigmas[detection][is_det_other]   , ecolor = all_colors[detection][is_det_other].astype('str'),     fmt = '.'   , alpha = 0.8, ms = 0)
-    plt.scatter (all_phases[detection][is_det_ZTF]  , all_magnitudes[detection][is_det_ZTF]  ,                                       color = all_colors[detection][is_det_ZTF].astype('str')  ,  marker = 'd'   , alpha = 0.8, s = 90)
-    plt.scatter (all_phases[detection][is_det_Local] , all_magnitudes[detection][is_det_Local] ,                                       color = all_colors[detection][is_det_Local].astype('str') ,  marker = '*'   , alpha = 0.8, s = 90)
-    plt.scatter (all_phases[detection][is_det_other], all_magnitudes[detection][is_det_other],                                       color = all_colors[detection][is_det_other].astype('str'),  marker = '.'   , alpha = 0.8, s = 90)
-    # Plot Data (Upper limits)
-    plt.scatter (all_phases[upper_limit], all_magnitudes[upper_limit], color = all_colors[upper_limit].astype('str'), marker = 'v', alpha = 0.5, s = 90)
-
-    ### Plot Ignored Data
-    ignore_alpha = 0.15
-    # Select groups of Data (detectiond and upper limits)
-    was_det_ZTF   = np.where(all_sources[detect_ignore] == 'ZTF')[0]
-    was_det_Local  = np.where(all_sources[detect_ignore] == 'Local')[0]
-    was_det_other = np.where([i not in ['ZTF', 'Local'] for i in all_sources[detect_ignore]])[0]
-    # (detections)
-    plt.errorbar(all_phases[detect_ignore][was_det_ZTF]  , all_magnitudes[detect_ignore][was_det_ZTF]  , all_sigmas[detect_ignore][was_det_ZTF]  , ecolor = all_colors[detect_ignore][was_det_ZTF].astype('str')  ,     fmt = 'd'   , alpha = ignore_alpha, ms = 0)
-    plt.errorbar(all_phases[detect_ignore][was_det_Local] , all_magnitudes[detect_ignore][was_det_Local] , all_sigmas[detect_ignore][was_det_Local] , ecolor = all_colors[detect_ignore][was_det_Local].astype('str') ,     fmt = '*'   , alpha = ignore_alpha, ms = 0)
-    plt.errorbar(all_phases[detect_ignore][was_det_other], all_magnitudes[detect_ignore][was_det_other], all_sigmas[detect_ignore][was_det_other], ecolor = all_colors[detect_ignore][was_det_other].astype('str'),     fmt = '.'   , alpha = ignore_alpha, ms = 0)
-    plt.scatter (all_phases[detect_ignore][was_det_ZTF]  , all_magnitudes[detect_ignore][was_det_ZTF]  ,                                           color  = all_colors[detect_ignore][was_det_ZTF].astype('str')  ,  marker = 'd'   , alpha = ignore_alpha, s = 90)
-    plt.scatter (all_phases[detect_ignore][was_det_Local] , all_magnitudes[detect_ignore][was_det_Local] ,                                           color  = all_colors[detect_ignore][was_det_Local].astype('str') ,  marker = '*'   , alpha = ignore_alpha, s = 90)
-    plt.scatter (all_phases[detect_ignore][was_det_other], all_magnitudes[detect_ignore][was_det_other],                                           color  = all_colors[detect_ignore][was_det_other].astype('str'),  marker = '.'   , alpha = ignore_alpha, s = 90)
-    # (Upper limits)
-    plt.scatter (all_phases[upper_ignore], all_magnitudes[upper_ignore], color = all_colors[upper_ignore].astype('str'), marker = 'v', alpha = ignore_alpha, s = 90)
-
-    #plt.rcParams['xtick.bottom'] = plt.rcParams['xtick.labelbottom'] = True
-    #plt.rcParams['xtick.top'] = plt.rcParams['xtick.labeltop'] = False
-    if full_range:
-        #plt.rcParams['xtick.bottom'] = plt.rcParams['xtick.labelbottom'] = False
-        #plt.rcParams['xtick.top'] = plt.rcParams['xtick.labeltop'] = True
-        plt.tick_params(axis='both', top=False, bottom=True, labeltop=False, labelbottom=True)
-        plt.xlabel('MJD', fontsize = 11)
-    else:
-        plt.tick_params(axis='both', top=False, bottom=True, labeltop=False, labelbottom=True)
-        plt.xlabel('Days Since Brightest Point', fontsize = 11)
-
-    plt.ylabel('Magnitude', fontsize = 11)
-    plt.xticks(fontsize = 11)
-    plt.yticks(fontsize = 11)
-
-    # Plot fits to the data
-    if plot_model:
-        model_time    = np.linspace(-80, 200, 1000)
-        model_red     = linex(model_time, red_amplitude  , red_amplitude2  , red_offset  , red_magnitude  )
-        model_green   = linex(model_time, green_amplitude, green_amplitude2, green_offset, green_magnitude)
-
-        plt.plot(model_time, model_red    , color = 'r', linestyle = ':', linewidth = 0.5)
-        plt.plot(model_time, model_green  , color = 'g', linestyle = ':', linewidth = 0.5)
-        if np.isfinite(chi2):
-            plt.plot([]        , []           , color = 'k', linestyle = ':', linewidth = 0.5, label = r'$\chi^2 = %s$'%round(chi2, 2))
-            plt.legend(loc = 'upper right')
-
-    # Plot comparison TDE, Ia, and SLSN
-    if plot_comparison & (full_range == False):
-        brightest_mag = np.nanmin(all_magnitudes[detection])
-        max_Ia = np.nanmin(magnitude_1a_model_r + brightest_mag)
-        plt.plot(time_1a_model_r, magnitude_1a_model_r + brightest_mag, color = 'm', linestyle = '--', linewidth = 1)
-
-    used_colors, used_sources = np.unique(all_filters), np.unique(all_sources)
-    return used_colors, used_sources
-
-def plot_legend(sub_y, sub_x, sub_n, used_colors, used_sources):
-    '''
-    Include a legend
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n  : Subplot parameters (rows, columns, plot number)
-    used_colors   : Colors from plot_lightcurve() used
-    used_sources  : Sources from plot_lightcurve() used
-    '''
-
-    # Select Plot Colors
-    all_colors = plot_colors(used_colors)
-
-    # Select groups of Data (detectiond and upper limits)
-    is_det_ZTF   = np.where(used_sources == 'ZTF' )[0]
-    is_det_FLWO  = np.where((used_sources == 'FLWO') | (used_sources == 'Local'))[0]
-    is_det_other = np.where([i not in ['ZTF', 'FLWO', 'Local'] for i in used_sources])[0]
-
-    plt.subplot(sub_y, sub_x, sub_n)
-    if len(is_det_ZTF)   > 0: plt.scatter([], [], marker = 'd', alpha = 1.0, s = 90, color = 'k', label = 'ZTF'  )
-    if len(is_det_FLWO)  > 0: plt.scatter([], [], marker = '*', alpha = 1.0, s = 90, color = 'k', label = 'Local')
-    if len(is_det_other) > 0: plt.scatter([], [], marker = 'o', alpha = 1.0, s = 90, color = 'k', label = 'OSC'  )
-
-    for i in range(len(used_colors)):
-        plt.scatter([], [], marker = 'o', alpha = 1.0, s = 90, color = all_colors[i], label = used_colors[i])
-
-    plt.legend(loc = 'center', frameon = False, fontsize = 11)
-    plt.tick_params(axis='both', left=False, top=False, right=False, bottom=False, labelleft=False, labeltop=False, labelright=False, labelbottom=False)
-    plt.axis('off')
-
-def query_PS1_image(ra_deg, dec_deg, image_color, wcs_size = 90, autoscale = 75):
-    '''
-    Query the 3pi website and download an image in the 
+def query_PS1_image(ra_deg, dec_deg, image_color, wcs_size=90, autoscale=75):
+    """
+    Query the 3pi website and download an image in the
     specified filter. If no image was found return '--'.
     If the image_color is not found, return it in 'r' band.
 
     Parameters
-    ---------------
-    ra_deg, dec_deg : Coordinates of the object in degrees
-    image_color     : Filter to search for, either 'g', 'r', 'i', 'z', or 'y'
-    wcs_size        : Image size in arcsec 
-    autoscale       : scaling of the image
+    ----------
+    ra_deg : float
+        Coordinates of the object in degrees
+    dec_deg : float
+        Coordinates of the object in degrees
+    image_color : str
+        Filter to search for, either 'g', 'r', 'i', 'z', or 'y'
+    wcs_size : float
+        Image size in arcsec
+    autoscale : float
+        Scaling of the image
 
-    Output
-    ---------------
-    img : Image file
-    '''
+    Returns
+    -------
+    img : PIL Image object
+        Image of the object in the specified filter
+        or None if no image was found.
+    """
 
+    # Set image size
     image_size = wcs_size * 4
 
-    # Request data from PS1 website
-    if image_color in 'grizy':
-        if dec_deg > 0:
-            requests_link = "http://ps1images.stsci.edu/cgi-bin/ps1cutouts?pos=" + str(np.around(ra_deg, decimals = 6)) + "+" + str(np.around(dec_deg, decimals = 6)) + "&filter=" + image_color + "&size=" + str(image_size) + "&autoscale=" + str(autoscale)
-        else:
-            requests_link = "http://ps1images.stsci.edu/cgi-bin/ps1cutouts?pos=" + str(np.around(ra_deg, decimals = 6))       + str(np.around(dec_deg, decimals = 6)) + "&filter=" + image_color + "&size=" + str(image_size) + "&autoscale=" + str(autoscale)
-
-    # If no available filter, use r
+    # Format RA and dec
+    if dec_deg > 0:
+        ra_deg_str = str(np.around(ra_deg, decimals=6)) + '+' + str(np.around(dec_deg, decimals=6))
     else:
-        if dec_deg > 0:
-            requests_link = "http://ps1images.stsci.edu/cgi-bin/ps1cutouts?pos=" + str(np.around(ra_deg, decimals = 6)) + "+" + str(np.around(dec_deg, decimals = 6)) + "&filter=" + 'r' + "&size=" + str(image_size) + "&autoscale=" + str(autoscale)
-        else:
-            requests_link = "http://ps1images.stsci.edu/cgi-bin/ps1cutouts?pos=" + str(np.around(ra_deg, decimals = 6))       + str(np.around(dec_deg, decimals = 6)) + "&filter=" + 'r' + "&size=" + str(image_size) + "&autoscale=" + str(autoscale)
+        ra_deg_str = str(np.around(ra_deg, decimals=6)) + str(np.around(dec_deg, decimals=6))
 
-    python_version = sys.version_info[0]
+    # Make sure filter is valid
+    if image_color not in ['g', 'r', 'i', 'z', 'y']:
+        print("Invalid filter. Using 'r' instead.")
+        image_color = 'r'
+
+    # Request data from PS1 website
+    requests_link = ("http://ps1images.stsci.edu/cgi-bin/ps1cutouts?pos=" + ra_deg_str + "&filter=" + image_color + "&size=" +
+                     str(image_size) + "&autoscale=" + str(autoscale))
+
     try:
-        if python_version == 3:
-            # Extract image
-            image_req  = requests.get(requests_link)
-            image_data = image_req.text
-            soup       = BeautifulSoup(image_data, "html5lib")
-            URL        = 'http:' + soup.find_all('img')[1].get('src')
-            file       = BytesIO(urllib.request.urlopen(URL).read())
-        elif python_version == 2:
-            import cStringIO
-            # Extract image
-            image_req  = requests.get(requests_link)
-            image_data = image_req.text
-            soup       = BeautifulSoup(image_data, "lxml")
-            URL        = 'http:' + soup.find_all('img')[1].get('src')
-            file       = cStringIO.StringIO(urllib.urlopen(URL).read())
+        # Extract image
+        image_req = requests.get(requests_link)
+        image_data = image_req.text
+        soup = BeautifulSoup(image_data, features="html.parser")
+        URL = 'http:' + soup.find_all('img')[1].get('src')
+        file = BytesIO(urllib.request.urlopen(URL).read())
         img = Image.open(file)
         return img
-    except:
-        return '--'
+    except Exception as e:
+        print("Error: ", e)
+        print("No image found for %s %s in %s band" % (ra_deg, dec_deg, image_color))
+        return None
 
-def plot_field_image(sub_y, sub_x, sub_n, ra_deg, dec_deg, object_name, image_color = 'r', search_radius = 1.0, autoscale = 75):
-    '''
-    Plot the field image at the given RA and DEC from 3PI
 
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    ra_deg, dec_deg     : Coordiantes of the star in degrees
-    object_name         : Title with transient type
-    image_color         : Filter name
-    search_radius       : Radius of the image in arcminutes
-    autoscale           : PS1 scaling (lower is more contrast)
-    '''
-
-    # Create folder to store images, if it doesn't exist
-    if len(glob.glob('images')) == 0:
-        os.system("mkdir images")
-
-    # If the image exists, open it
-    wcs_size = int(search_radius * 2 * 60)
-    exists = glob.glob('images/%s.jpeg'%object_name)
-    if len(exists) == 0:
-        img = query_PS1_image(float(ra_deg), float(dec_deg), image_color, wcs_size, autoscale)
-        try:
-            img.save('images/%s.jpeg'%object_name, 'jpeg')
-        except:
-            pass
-    else:
-        img = Image.open('images/%s.jpeg'%object_name)        
-
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.tick_params(axis='both', left=False, top=False, right=False, bottom=False, labelleft=False, labeltop=False, labelright=False, labelbottom=False)
-    if img == '--':
-        plt.annotate('Outside PS1 footprint', xy=(0,0))
-        plt.set_xlim(-0.5, 1)
-        plt.set_ylim(-1, 1)
-    else:
-        plt.imshow(np.array(img), cmap = 'viridis')
-
-    plt.scatter(wcs_size*2, wcs_size*2, marker = '+', color = 'r')
-
-def extinct(output_table, g_correct = 0, r_correct = 0):
-    '''
-    Correct table for extinction, only g and r bands 
-    for plotting purposes
+def calc_airmass(RA, DEC, Telescope, do_observability=True):
+    """
+    Calculate the Airmass of a source from a specified telescope
 
     Parameters
-    ---------------
-    output_table     : Data with photometry
-    g_correct        : extinction value in g band
-    r_correct        : extinction value in r band
+    ----------
+    RA : str
+        Right Ascension of the star in 00:00:00 format
+    DEC : str
+        Declination of the star in 00:00:00 format
+    Telescope : str
+        Name of the telescope to calculate the airmass for
+        Options are: MMT, Magellan, FLWO, Kitt Peak, McDonald,
+        CTIO, Harvard, Las Campanas, AAT, HWT, Gemini_North,
+        Gemini_South
+    do_observability : bool
+        If True, calculate the airmass and sun elevation
 
-    Output
-    ---------------
-    output_table_correct
-    '''
-
-    output_table_correct = table.Table(output_table)
-
-    # Separate into green and red filters
-    green = np.where(((output_table['Filter'] == 'g') | (output_table['Filter'] == "g'")))
-    red   = np.where(((output_table['Filter'] == 'r') | (output_table['Filter'] == 'R') | (output_table['Filter'] == "r'")))
-
-    output_table_correct['Mag'][green] = output_table['Mag'][green] - g_correct
-    output_table_correct['Mag'][red]   = output_table['Mag'][red]   - r_correct
-
-    return output_table_correct
-
-def plot_nature_mag_distance(sub_y, sub_x, sub_n, separation, hosts_magnitudes, output_nature, transient_magnitude, host_separation, host_magnitude, host_nature, closest_separation, closest_magnitude, closest_nature, search_radius):
-    '''
-    Plot the host magnitude as a function of distance from transient
-    And make the size equal to the probability of being a galaxy
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    separation          : Separation between transient and objects in arcsec
-    hosts_magnitudes    : Magnitude of objects
-    output_nature       : Probability of object being a galaxy
-    transient_magnitude : Brightest transient magnitude
-    host_separation     : Separation of the host and transient
-    host_magnitude      : Magnitude of the host
-    host_nature         : Probability of host being a galaxy
-    search_radius       : For plot limit purposes
-    '''
-
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.gca().invert_yaxis()
-    plt.title("Probability of being a Galaxy")
-    plt.scatter(separation, hosts_magnitudes, s = (output_nature + 0.1)*1000, c = (output_nature + 0.1)*1000, vmin=0, vmax=1000, alpha = 0.75)
-    plt.scatter(host_separation, host_magnitude, marker='+', alpha = 1.0, color = 'b', s = 1000)
-    plt.axhline(float(transient_magnitude), color = 'b', linestyle = '--', linewidth = 1, label = "Brightest Mag = %s"%np.around(float(transient_magnitude), decimals = 2))
-    plt.axhline(float(host_magnitude), color = 'k', linestyle = '-.', linewidth = 1)
-    if host_separation < search_radius * 60 + 2:
-        plt.annotate(str(np.around(host_nature, decimals = 2)), xy=(host_separation, host_magnitude))
-        if host_separation != closest_separation:
-            plt.annotate(str(np.around(closest_nature, decimals = 2)), xy=(closest_separation, closest_magnitude))
-    plt.legend(loc = 'best', fancybox = True)
-    plt.xlim(0, search_radius * 60 + 2)
-    plt.xlabel("Distance from Transient [Arcsec]")
-    plt.ylabel("Magnitude")
-
-def plot_host_mag_distance(sub_y, sub_x, sub_n, separation_total, brightest_host, output_nature, average_coincidence, transient_magnitude, host_separation, host_magnitude, host_Pcc, closest_separation, closest_magnitude, closest_coincidence, search_radius, star_cut):
-    '''
-    Plot the host magnitude as a function of distance from transient
-    And make the size equal to the probability of being the host
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    separation_total    : Separation between transient and objects in arcsec
-    brightest_host      : Magnitude of objects
-    output_nature       : Probability of object being a galaxy
-    average_coincidence : Probability of chance coincidence for objects in field
-    transient_magnitude : Brightest transient magnitude
-    host_separation     : Separation of the host and transient
-    host_magnitude      : Magnitude of the host
-    host_Pcc            : Probability of chance coincidece of the host
-    maybe_galaxies      : Which objects from the total list are galaxies
-    search_radius       : For plot limit purposes
-    star_cut            : which of the objects are likely galaxies
-    closest_separation  : Separation of the closest object
-    closest_magnitude   : Magnitude of the closest object
-    closest_coincidence : Probability of chance coincidece of the closest object
-    '''
-
-    maybe_galaxies = np.where(output_nature >  star_cut)[0]
-    stars          = np.where(output_nature <= star_cut)[0]
-
-    average_probability = 1 - average_coincidence
-    host_probability    = 1 - host_Pcc
-    closest_probability = 1 - closest_coincidence
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.gca().invert_yaxis()
-    plt.title("Probability of being the Host")
-    plt.scatter(separation_total[maybe_galaxies], brightest_host[maybe_galaxies], s = (average_probability[maybe_galaxies] + 0.1)*1000, c = (average_probability[maybe_galaxies] + 0.1)*1000, vmin=0, vmax=1000, alpha = 0.75)
-    plt.scatter(separation_total[stars], brightest_host[stars],                   s = 100                            , c = 'r'                            , marker = 'x', alpha = 0.75, label = 'Stars')
-    plt.scatter(host_separation, host_magnitude, marker='+', alpha = 1.0, color = 'b', s = 1000)
-    plt.axhline(float(transient_magnitude), color = 'b', linestyle = '--', linewidth = 1)
-    plt.axhline(float(host_magnitude), color = 'k', linestyle = '-.', linewidth = 1)
-    if host_separation <= search_radius * 60 + 2:
-        if host_separation != closest_separation:
-            plt.annotate(str(np.around(closest_probability, decimals = 2)), xy=(closest_separation, closest_magnitude))
-        plt.annotate(str(np.around(host_probability, decimals = 2)), xy=(host_separation, host_magnitude))
-    plt.legend(loc = 'best', fancybox = True)
-    plt.xlim(0, search_radius * 60 + 2)
-    plt.xlabel("Distance from Transient [Arcsec]")
-    plt.ylabel("Magnitude")
-
-#def plot_host_information(sub_y, sub_x, sub_n, data_catalog, best_host, output_table, TNS_name, ZTF_name, ra_deg, dec_deg, host_separation, host_radius, star_host, magnitudes_array, magnitudes_colors, redshift, z_ned, z_flag_ned, z_simbad, z_sdss, zerr_sdss, TNS_class, TNS_redshift):
-def plot_host_information(sub_y, sub_x, sub_n, ra_deg, dec_deg, info_table, host_radius, host_separation, host_magnitude, transient_magnitude):
-    '''
-    Make a plot with information about the transient and the host
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    ra_deg, dec_deg     : Coordiantes of the target in degrees
-    info_table          : Table with all the output FLEET information
-    host_radius         : The half-light radius of the best host in arcsec
-    host_separation     : The transient-host separation in arcsec
-    host_magnitude      : The magnitude of the best host
-    transient_magnitude : Peak Magnitude of the transient
-    '''
-    # Empty array
-    emptys = ['',' ','None','--', '-', b'',b' ',b'None',b'--', b'-', None, np.nan, 'nan', b'nan', '0', np.inf, 'inf']
-
-    # Name
-    object_name = info_table['object_name'][0]
-    ZTF_name    = info_table['ztf_name'][0]
-    TNS_name    = info_table['tns_name'][0]
-    if object_name == ZTF_name: ZTF_name = ''
-    if object_name == TNS_name: TNS_name = ''
-    if ZTF_name in emptys: ZTF_name = ''
-    if TNS_name in emptys: TNS_name = ''
-
-    # Classification
-    object_class = info_table['object_class'][0]
-
-    # Coordinates Info
-    coords    = SkyCoord(ra_deg, dec_deg, unit = 'deg')
-    coord_str = coords.to_string('hmsdms', sep = ':')
-    RA_hms    = coord_str[:coord_str.find(' ')]
-    DEC_dms   = coord_str[coord_str.find(' ')+1:]
-    l_deg     = coords.galactic.l.value
-    b_deg     = coords.galactic.b.value
-
-    # Redsfhit Info
-    redshift = info_table['redshift']
-    redshift_label = info_table['redshift_label']
-
-    # If there's additional photo-z info, add it
-    if (redshift_label == 'specz'):
-        try:
-            photoz     = float(info_table['photoz'])
-            photoz_err = float(info_table['photoz_err'])
-        except:
-            photoz = photoz_err = '--'
-    else:
-        photoz = photoz_err = '--'
-
-    # Classifier Info
-    try:
-        P_quick_AGN             = float(info_table['P_quick_AGN'])
-        P_quick_SLSNI           = float(info_table['P_quick_SLSNI'])
-        P_quick_SLSNII          = float(info_table['P_quick_SLSNII'])
-        P_quick_SNII            = float(info_table['P_quick_SNII']) + float(info_table['P_quick_SNIIb']) + float(info_table['P_quick_SNIIn'])
-        P_quick_SNI             = float(info_table['P_quick_SNIa']) + float(info_table['P_quick_SNIbc'])
-        P_quick_Star            = float(info_table['P_quick_Star'])
-        P_quick_TDE             = float(info_table['P_quick_TDE'])
-        P_quick_AGN_std         = float(info_table['P_quick_AGN_std'])
-        P_quick_SLSNI_std       = float(info_table['P_quick_SLSNI_std'])
-        P_quick_SLSNII_std      = float(info_table['P_quick_SLSNII_std'])
-        P_quick_SNII_std        = np.sqrt(float(info_table['P_quick_SNII_std']) ** 2 + float(info_table['P_quick_SNIIb_std']) ** 2 + float(info_table['P_quick_SNIIn_std']) ** 2)
-        P_quick_SNI_std         = np.sqrt(float(info_table['P_quick_SNIa_std']) ** 2 + float(info_table['P_quick_SNIbc_std']) ** 2)
-        P_quick_Star_std        = float(info_table['P_quick_Star_std'])
-        P_quick_TDE_std         = float(info_table['P_quick_TDE_std'])
-
-        P_late_AGN              = float(info_table['P_late_AGN'])
-        P_late_SLSNI            = float(info_table['P_late_SLSNI'])
-        P_late_SLSNII           = float(info_table['P_late_SLSNII'])
-        P_late_SNII             = float(info_table['P_late_SNII']) + float(info_table['P_late_SNIIb']) + float(info_table['P_late_SNIIn'])
-        P_late_SNI              = float(info_table['P_late_SNIa']) + float(info_table['P_late_SNIbc'])
-        P_late_Star             = float(info_table['P_late_Star'])
-        P_late_TDE              = float(info_table['P_late_TDE'])
-        P_late_AGN_std          = float(info_table['P_late_AGN_std'])
-        P_late_SLSNI_std        = float(info_table['P_late_SLSNI_std'])
-        P_late_SLSNII_std       = float(info_table['P_late_SLSNII_std'])
-        P_late_SNII_std         = np.sqrt(float(info_table['P_late_SNII_std']) ** 2 + float(info_table['P_late_SNIIb_std']) ** 2 + float(info_table['P_late_SNIIn_std']) ** 2)
-        P_late_SNI_std          = np.sqrt(float(info_table['P_late_SNIa_std']) ** 2 + float(info_table['P_late_SNIbc_std']) ** 2)
-        P_late_Star_std         = float(info_table['P_late_Star_std'])
-        P_late_TDE_std          = float(info_table['P_late_TDE_std'])
-
-        P_redshift_AGN          = float(info_table['P_redshift_AGN'])
-        P_redshift_SLSNI        = float(info_table['P_redshift_SLSNI'])
-        P_redshift_SLSNII       = float(info_table['P_redshift_SLSNII'])
-        P_redshift_SNII         = float(info_table['P_redshift_SNII']) + float(info_table['P_redshift_SNIIb']) + float(info_table['P_redshift_SNIIn'])
-        P_redshift_SNI          = float(info_table['P_redshift_SNIa']) + float(info_table['P_redshift_SNIbc'])
-        P_redshift_Star         = float(info_table['P_redshift_Star'])
-        P_redshift_TDE          = float(info_table['P_redshift_TDE'])
-        P_redshift_AGN_std      = float(info_table['P_redshift_AGN_std'])
-        P_redshift_SLSNI_std    = float(info_table['P_redshift_SLSNI_std'])
-        P_redshift_SLSNII_std   = float(info_table['P_redshift_SLSNII_std'])
-        P_redshift_SNII_std     = np.sqrt(float(info_table['P_redshift_SNII_std']) ** 2 + float(info_table['P_redshift_SNIIb_std']) ** 2 + float(info_table['P_redshift_SNIIn_std']) ** 2)
-        P_redshift_SNI_std      = np.sqrt(float(info_table['P_redshift_SNIa_std']) ** 2 + float(info_table['P_redshift_SNIbc_std']) ** 2)
-        P_redshift_Star_std     = float(info_table['P_redshift_Star_std'])
-        P_redshift_TDE_std      = float(info_table['P_redshift_TDE_std'])
-
-        P_host_AGN              = float(info_table['P_host_AGN'])
-        P_host_SLSNI            = float(info_table['P_host_SLSNI'])
-        P_host_SLSNII           = float(info_table['P_host_SLSNII'])
-        P_host_SNII             = float(info_table['P_host_SNII']) + float(info_table['P_host_SNIIb']) + float(info_table['P_host_SNIIn'])
-        P_host_SNI              = float(info_table['P_host_SNIa']) + float(info_table['P_host_SNIbc'])
-        P_host_Star             = float(info_table['P_host_Star'])
-        P_host_TDE              = float(info_table['P_host_TDE'])
-        P_host_AGN_std          = float(info_table['P_host_AGN_std'])
-        P_host_SLSNI_std        = float(info_table['P_host_SLSNI_std'])
-        P_host_SLSNII_std       = float(info_table['P_host_SLSNII_std'])
-        P_host_SNII_std         = np.sqrt(float(info_table['P_host_SNII_std']) ** 2 + float(info_table['P_host_SNIIb_std']) ** 2 + float(info_table['P_host_SNIIn_std']) ** 2)
-        P_host_SNI_std          = np.sqrt(float(info_table['P_host_SNIa_std']) ** 2 + float(info_table['P_host_SNIbc_std']) ** 2)
-        P_host_Star_std         = float(info_table['P_host_Star_std'])
-        P_host_TDE_std          = float(info_table['P_host_TDE_std'])
-    except:
-        P_quick_AGN=P_quick_SLSNI=P_quick_SLSNII=P_quick_SNII=P_quick_SNI=P_quick_Star=P_quick_TDE=P_quick_AGN_std=P_quick_SLSNI_std=P_quick_SLSNII_std=P_quick_SNII_std=0.0
-        P_quick_SNI_std=P_quick_Star_std=P_quick_TDE_std=P_late_AGN=P_late_SLSNI=P_late_SLSNII=P_late_SNII=P_late_SNI=P_late_Star=P_late_TDE=P_late_AGN_std=P_late_SLSNI_std=0.0
-        P_late_SLSNII_std=P_late_SNII_std=P_late_SNI_std=P_late_Star_std=P_late_TDE_std=P_redshift_AGN=P_redshift_SLSNI=P_redshift_SLSNII=P_redshift_SNII=P_redshift_SNI=P_redshift_Star=0.0
-        P_redshift_TDE=P_redshift_AGN_std=P_redshift_SLSNI_std=P_redshift_SLSNII_std=P_redshift_SNII_std=P_redshift_SNI_std=P_redshift_Star_std=P_redshift_TDE_std=P_host_AGN=P_host_SLSNI=0.0
-        P_host_SLSNII=P_host_SNII=P_host_SNI=P_host_Star=P_host_TDE=P_host_AGN_std=P_host_SLSNI_std=P_host_SLSNII_std=P_host_SNII_std=P_host_SNI_std=P_host_Star_std=P_host_TDE_std=0.0
-
-    ############## Generate Legend ##############
-
-    # Names
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.title('%s     %s    %s'%(object_name, TNS_name, ZTF_name))
-
-    # Coordinates
-    legend_name  = 'RA = %s  DEC = %s\n'%(RA_hms, DEC_dms)
-    legend_name += '         %s                     %s\n'%(round(ra_deg,5), round(dec_deg,5))
-    legend_name += ' l = %s               b = %s\n\n'%(round(l_deg,5) , round(b_deg,5))
-
-    # Magnitudes
-    if object_class not in emptys : legend_name += object_class + '\n'
-    legend_name += r'$\Delta$M = %s $- %s = %s$'%(round(host_magnitude, 2), round(transient_magnitude, 2), round(host_magnitude - transient_magnitude, 2)) + '\n'
-
-    # Size
-    legend_name += 'Size = %s'%(round(host_radius, 2)) + "''\n"
-    legend_name += 'Separation = %s'%(round(host_separation, 2)) + "''\n"
-    legend_name += r'Offset = %s $R_e$'%(round(host_separation/host_radius, 2)) + '\n\n'
-
-    # Redshift And Magnitude    
-    absolute_magnitude = '--'
-    if redshift not in emptys:
-        if np.isfinite(float(redshift)):
-            legend_name += r'z = $%s$ (%s)'%(round(float(redshift), 3), redshift_label[0]) + '\n'
-            if float(redshift) > 0:
-                absolute_magnitude, _ = redshift_magnitude(transient_magnitude, float(redshift))
-    if photoz not in emptys:
-        if np.isfinite(float(photoz)):
-            legend_name += r'z = $%s\pm%s$ (%s)'%(round(float(photoz), 3), round(photoz_err, 3), 'photoz') + '\n'
-    if str(absolute_magnitude) not in emptys : legend_name += 'Abs. Mag = %s\n\n'%(round(absolute_magnitude, 2))
-
-    # ML Classification
-    legend_name += '           AGN  SLSN-I  SLSN-II  SNII  SNI  Star  TDE\n'
-    if np.isfinite(P_late_AGN):
-        if np.isfinite(P_late_AGN_std):
-            legend_name += r'Late       %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f'%(P_late_AGN,P_late_AGN_std,P_late_SLSNI,P_late_SLSNI_std,P_late_SLSNII,P_late_SLSNII_std,P_late_SNII,P_late_SNII_std,P_late_SNI,P_late_SNI_std,P_late_Star,P_late_Star_std,P_late_TDE,P_late_TDE_std) + '\n'
-        else:
-            legend_name += r'Late       %.0f        %.0f        %.0f        %.0f        %.0f        %.0f        %.0f     '%(P_late_AGN,P_late_SLSNI,P_late_SLSNII,P_late_SNII,P_late_SNI,P_late_Star,P_late_TDE) + '\n'
-    if np.isfinite(P_quick_AGN):
-        if np.isfinite(P_quick_AGN_std):
-            legend_name += r'SLSN       %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f'%(P_quick_AGN,P_quick_AGN_std,P_quick_SLSNI,P_quick_SLSNI_std,P_quick_SLSNII,P_quick_SLSNII_std,P_quick_SNII,P_quick_SNII_std,P_quick_SNI,P_quick_SNI_std,P_quick_Star,P_quick_Star_std,P_quick_TDE,P_quick_TDE_std) + '\n'
-        else:
-            legend_name += r'SLSN       %.0f        %.0f        %.0f        %.0f        %.0f        %.0f        %.0f     '%(P_quick_AGN,P_quick_SLSNI,P_quick_SLSNII,P_quick_SNII,P_quick_SNI,P_quick_Star,P_quick_TDE) + '\n'
-    #if np.isfinite(P_redshift_AGN):
-    #    if np.isfinite(P_redshift_AGN_std):
-    #        legend_name += r'redshift %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f'%(P_redshift_AGN,P_redshift_AGN_std,P_redshift_SLSNI,P_redshift_SLSNI_std,P_redshift_SLSNII,P_redshift_SLSNII_std,P_redshift_SNII,P_redshift_SNII_std,P_redshift_SNI,P_redshift_SNI_std,P_redshift_Star,P_redshift_Star_std,P_redshift_TDE,P_redshift_TDE_std) + '\n'
-    #    else:
-    #        legend_name += r'redshift %.0f        %.0f        %.0f        %.0f        %.0f        %.0f        %.0f     '%(P_redshift_AGN,P_redshift_SLSNI,P_redshift_SLSNII,P_redshift_SNII,P_redshift_SNI,P_redshift_Star,P_redshift_TDE) + '\n'
-    if np.isfinite(P_host_AGN):
-        if np.isfinite(P_host_AGN_std):
-            legend_name += r'TDE        %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f   %.0f$\pm$%.0f'%(P_host_AGN,P_host_AGN_std,P_host_SLSNI,P_host_SLSNI_std,P_host_SLSNII,P_host_SLSNII_std,P_host_SNII,P_host_SNII_std,P_host_SNI,P_host_SNI_std,P_host_Star,P_host_Star_std,P_host_TDE,P_host_TDE_std)
-        else:
-            legend_name += r'TDE        %.0f        %.0f        %.0f        %.0f        %.0f        %.0f        %.0f     '%(P_host_AGN,P_host_SLSNI,P_host_SLSNII,P_host_SNII,P_host_SNI,P_host_Star,P_host_TDE)
-
-    plt.tick_params(axis='both', left=False, top=False, right=False, bottom=False, labelleft=False, labeltop=False, labelright=False, labelbottom=False)
-    plt.annotate(legend_name, xy = (0.02, 0.96), fontsize = 10, va = 'top')
-    plt.xlim(0, 1)
-    plt.ylim(0, 1)
-
-def plot_observability(sub_y, sub_x, sub_n, ra_deg, dec_deg, Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan):
-    '''
-    Plot airmass graphs of a given object for MMT and Magellan 
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n                     : Subplot parameters (rows, columns, plot number)
-    ra_deg, dec_deg                         : Coordiantes of the star in degrees
-    Dates_MMT, Dates_Magellan               : Time array for MMT and Magellan airmass graph
-    Airmass_MMT, Airmass_Magellan           : Airmass array of MMT and Magellan
-    SunElevation_MMT, SunElevation_Magellan : Sun Elevantion for each Time, to calculate twilight
-    '''
-
-    # Airmass plots
-    axes = plt.subplot(sub_y, sub_x, sub_n)
-    plt.gca().invert_yaxis()
-    plt.plot(Dates_MMT, Airmass_MMT, color = 'g', linewidth = 4, label = 'MMT Airmass')
-    plt.fill_between(Dates_MMT, 0, 3.0, where=SunElevation_MMT <= -18.0, facecolor = 'g', alpha = 0.25, label = 'MMT Night')
-    plt.plot(Dates_Magellan, Airmass_Magellan, color = 'r', linewidth = 4, label = 'Magellan Airmass')
-    plt.fill_between(Dates_Magellan, 0.0, 3.0, where=SunElevation_Magellan <= -18.0, facecolor = 'r', alpha = 0.25, label = 'Magellan Night')
-    plt.legend(loc = 'upper left')
-    plt.ylabel("Airmass")
-    plt.title("UT = %s"%datetime.datetime.now().strftime('%Y-%m-%d') + "     MJD = %s"%np.around(Time(datetime.datetime.now()).mjd, decimals = 1))
-    plt.ylim(3, 0.5)
-    plt.xlim(min(Dates_MMT), max(Dates_MMT))
-
-    # Change Axes Labels
-    plt.xticks(Dates_MMT[::round(len(Dates_MMT) / 10)])
-    xfmt = md.DateFormatter('%H:%M')
-    axes.xaxis.set_major_formatter(xfmt)
-    plt.xlabel('UT')
-
-def plot_ra_dec_size(sub_y, sub_x, sub_n, objects_ra, objects_dec, ra_deg, dec_deg, output_nature, host_ra, host_dec, search_radius, halflight_radius, transient_magnitude):
-    '''
-    Plot the field objects in RA and DEC, where the size
-    is the size of the objects
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    objects_ra          : RA in degrees for objects in field
-    objects_dec         : DEC in degrees for objects in field
-    ra_deg              : Target RA
-    dec_deg             : Target DEC
-    output_nature       : Probabiliy of objects being a galaxy
-    host_ra             : Host RA
-    host_dec            : Host DEC
-    search_radius       : For plot limit purposes
-    halflight_radius    : Size of objects (half light radius)
-    transient_magnitude : Magnitude of the transient
-    '''
-
-    Lum_Transient = 10 ** 9 * (10 ** (-0.4 * float(transient_magnitude)))
-
-    within = (flot(objects_ra) < ra_deg + search_radius / 60) & (flot(objects_ra) > ra_deg - search_radius / 60) & (flot(objects_dec) < dec_deg + search_radius / 60) & (flot(objects_dec) > dec_deg - search_radius / 60)
-
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.gca().invert_xaxis()
-    plt.title("Probability of being a Galaxy (Size)")
-    plt.scatter(flot(objects_ra[within]), flot(objects_dec[within]), s = (output_nature[within] + 0.1)*1000, c = (output_nature[within] + 0.1)*1000, vmin=0, vmax=1000, alpha = 0.75)
-    plt.scatter(ra_deg, dec_deg, marker='*', color = 'r', s = Lum_Transient)
-    plt.scatter(host_ra, host_dec, marker='+', alpha = 1.0, color = 'b', s = 1000)
-    plt.xlabel("RA")
-    plt.ylabel("DEC")
-    plt.xlim(ra_deg  + search_radius / 60, ra_deg  - search_radius / 60)
-    plt.ylim(dec_deg - search_radius / 60, dec_deg + search_radius / 60)
-    #ax1.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
-    #ax1.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
-    plt.ticklabel_format(useOffset=False)
-    for j in range(len(objects_ra[within])):
-        if np.isfinite(halflight_radius[within][j]):
-            plt.annotate(str(np.around(halflight_radius[within][j], decimals = 2)), xy=(objects_ra[within][j], objects_dec[within][j]))
-
-def plot_ra_dec_magnitude(sub_y, sub_x, sub_n, objects_ra, objects_dec, ra_deg, dec_deg, hosts_magnitudes, host_ra, host_dec, search_radius, transient_magnitude):
-    '''
-    Plot the field objects in RA and DEC, where the size
-    is the size of the objects
-
-    Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    objects_ra          : RA in degrees for objects in field
-    objects_dec         : DEC in degrees for objects in field
-    ra_deg              : Target RA
-    dec_deg             : Target DEC
-    hosts_magnitudes    : Magnitudes of the objects in the field
-    host_ra             : Host RA
-    host_dec            : Host DEC
-    search_radius       : For plot limit purposes
-    transient_magnitude : Magnitude of the transient
-    '''
-
-    Lum_Transient = 10 ** 9 * (10 ** (-0.4 * float(transient_magnitude)))
-    Lum = 10 ** 9 * (10 ** (-0.4 * hosts_magnitudes))
-
-    plt.subplot(sub_y, sub_x, sub_n)
-    plt.gca().invert_xaxis()
-    plt.title("Magnitude")
-    plt.scatter(flot(objects_ra), flot(objects_dec), s = 40 * Lum, c = Lum, alpha = 0.75)
-    plt.scatter(ra_deg, dec_deg, marker='*', color = 'r', s = Lum_Transient)
-    plt.scatter(host_ra, host_dec, marker='+', alpha = 1.0, color = 'b', s = 1000, label = 'Best Host')
-    plt.legend(loc = 'best')
-    plt.xlabel("RA")
-    plt.xlim(ra_deg + search_radius / 60, ra_deg - search_radius / 60)
-    plt.ylim(dec_deg - search_radius / 60, dec_deg + search_radius / 60)
-    plt.ticklabel_format(useOffset=False)
-    #ax2.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
-    #ax2.yaxis.set_major_formatter(ScalarFormatter(useOffset=False))
-
-def calc_airmass(RA, DEC, Telescope, do_observability = True):
-    '''
-    Calculate the Airmass of a star from a specified telescope
-
-    Parameters
-    ---------------
-    RA, DEC   : Coordiantes of the star in 00:00:00 format
-    Telescope : Telescope for which to calculate the airmass
-
-    Return
-    ---------------
-    Dates        : Array of dates to calculate the airmass
-    Airmass      : Airmass value at each date
-    SunElevation : Sun's elevation at each date
-    '''
+    Returns
+    -------
+    Dates : array
+        Array of dates to calculate the airmass
+    Airmass : array
+        Airmass value at each date
+    SunElevation : array
+        Sun's elevation at each date
+    """
 
     # Specify the coordinates based on the observatory
-    if Telescope == 'MMT'          : Lat, Lon, Alt =  31.6883, -110.885, 2608
-    if Telescope == 'Magellan'     : Lat, Lon, Alt = -29.0182, -70.6915, 2516
-    if Telescope == 'FLWO'         : Lat, Lon, Alt =  31.6816, -110.876, 2344
-    if Telescope == 'Kitt Peak'    : Lat, Lon, Alt =  31.9633, -111.600, 2120
-    if Telescope == 'McDonald'     : Lat, Lon, Alt =  30.6716, -104.021, 2075
-    if Telescope == 'CTIO'         : Lat, Lon, Alt = -30.1650, -70.8150, 2215
-    if Telescope == 'Harvard'      : Lat, Lon, Alt =  42.3770, -71.1167,   54
-    if Telescope == 'Las Campanas' : Lat, Lon, Alt = -29.0182, -70.6915, 2380
-    if Telescope == 'AAT'          : Lat, Lon, Alt = -31.2754, 149.0672, 1164
-    if Telescope == 'HWT'          : Lat, Lon, Alt =  28.7610, -17.8820, 2332
-    if Telescope == 'Gemini_North' : Lat, Lon, Alt =  19.8200, -155.468, 4213
-    if Telescope == 'Gemini_South' : Lat, Lon, Alt = -30.2280, -70.7230, 2725
+    if Telescope == 'MMT':
+        Lat, Lon, Alt = 31.6883, -110.885, 2608
+    if Telescope == 'Magellan':
+        Lat, Lon, Alt = -29.0182, -70.6915, 2516
+    if Telescope == 'FLWO':
+        Lat, Lon, Alt = 31.6816, -110.876, 2344
+    if Telescope == 'Kitt Peak':
+        Lat, Lon, Alt = 31.9633, -111.600, 2120
+    if Telescope == 'McDonald':
+        Lat, Lon, Alt = 30.6716, -104.021, 2075
+    if Telescope == 'CTIO':
+        Lat, Lon, Alt = -30.1650, -70.8150, 2215
+    if Telescope == 'Harvard':
+        Lat, Lon, Alt = 42.3770, -71.1167,   54
+    if Telescope == 'Las Campanas':
+        Lat, Lon, Alt = -29.0182, -70.6915, 2380
+    if Telescope == 'AAT':
+        Lat, Lon, Alt = -31.2754, 149.0672, 1164
+    if Telescope == 'HWT':
+        Lat, Lon, Alt = 28.7610, -17.8820, 2332
+    if Telescope == 'Gemini_North':
+        Lat, Lon, Alt = 19.8200, -155.468, 4213
+    if Telescope == 'Gemini_South':
+        Lat, Lon, Alt = -30.2280, -70.7230, 2725
 
     # Create the observatory
     Observatory = ephem.Observer()
@@ -953,7 +298,7 @@ def calc_airmass(RA, DEC, Telescope, do_observability = True):
     # Choose start of date counter as right now with a stepsize in minutes
     # But set the start hour to 4PM
     Date0 = datetime.datetime.now()
-    Date0 = Date0.replace(hour = 16)
+    Date0 = Date0.replace(hour=16)
     Stepsize = 30
 
     # Empty Variables to modify
@@ -961,22 +306,29 @@ def calc_airmass(RA, DEC, Telescope, do_observability = True):
 
     # Define the start time of the observations, and the subsequent timesteps
     # For which to do the calculations.
-    Step  = datetime.timedelta(0, 60*Stepsize)
+    Step = datetime.timedelta(0, 60*Stepsize)
     Hours = np.arange(24*60/Stepsize)
     for i in range(len(Hours)):
         Dates = np.append(Dates, Date0 + Step * i)
 
     # Don't actually run the function if requested
-    if do_observability == False:
+    if not do_observability:
         return Dates, np.nan * np.ones(len(Dates)), np.nan * np.ones(len(Dates))
 
-    # Calculate the elevation of the sun
+    # Define the observer's location
+    location = EarthLocation(lat=Lat * u.deg, lon=Lon * u.deg, height=Alt * u.m)
+
     SunElevation = np.zeros(len(Dates))
     for i in range(len(Dates)):
-        SunElevation[i] = Astral.solar_elevation(Astral(), Dates[i], Lat, Lon)
+        # Convert the date to an Astropy Time object
+        time = Time(Dates[i])
+        # Calculate the Sun's position
+        sun_altaz = get_sun(time).transform_to(AltAz(obstime=time, location=location))
+        # Extract the Sun's elevation
+        SunElevation[i] = sun_altaz.alt.deg
 
     # Create the star
-    Star = ephem.readdb("Star,f|M|A0,%s,%s,0,2000"%(RA, DEC))
+    Star = ephem.readdb("Star,f|M|A0,%s,%s,0,2000" % (RA, DEC))
 
     # Calculate the airmass of the star for the selected dates
     ZenithAngle = np.zeros(len(Dates))
@@ -992,274 +344,1852 @@ def calc_airmass(RA, DEC, Telescope, do_observability = True):
 
     return Dates, Airmass, SunElevation
 
-def is_it_observable(Airmass_telescope, SunElevation_telescope, SunElevation = -18.0, max_airmass = 2.0):
-    '''
-    Determine if at any point an object is observable 
+
+def is_it_observable(Airmass_telescope, SunElevation_telescope, SunElevation=-18.0, max_airmass=2.0):
+    """
+    Determine if at any point an object is observable
     given its airmass and the Sun's elevation.
 
     Parameters
-    ---------------
-    Airmass_telescope      : Array of airmasses
-    SunElevation_telescope : Array of Sun's elevation
-    SunElevation           : Minimum Sun's elevation for astornomical twilight
-    max_airmass            : Maximum acceptable airmass for the object to be observable
+    ----------
+    Airmass_telescope : array
+        Array of airmasses
+    SunElevation_telescope : array
+        Array of Sun's elevation
+    SunElevation : float
+        Minimum Sun's elevation for astronomical twilight
+    max_airmass : float
+        Maximum acceptable airmass for the object to be observable
 
     Returns
-    -------------
-    Is the object observable? True or False
-    '''
+    -------
+    bool
+        True if the object is observable, False otherwise
+    """
 
     # Is the airmass a real number
     good_telescope = np.isfinite(Airmass_telescope)
     # Does it satisfy the conditions
-    observable_telescope = np.where((SunElevation_telescope[good_telescope] <= SunElevation)&(Airmass_telescope[good_telescope] < max_airmass))[0]
+    observable_telescope = np.where((SunElevation_telescope[good_telescope] <= SunElevation) & (Airmass_telescope[good_telescope] < max_airmass))[0]
 
     if len(observable_telescope) > 0:
         return True
     else:
         return False
 
-def calculate_observability(ra_deg, dec_deg, do_observability = True, SunElevation = -18.0, max_airmass = 2.0):
-    '''
-    Calculate the airmass for MMT and Magellan for an object
-    given an RA and DEC.
+
+def calculate_observability(ra_deg, dec_deg, do_observability=True, SunElevation=-18.0, max_airmass=2.0):
+    """
+    Calculate the airmass for MMT, Magellan, and McDonald for an object
+    given its RA and DEC.
 
     Parameters
-    ---------------
-    ra_deg, dec_deg : Coordiantes of the star in degrees
-    SunElevation    : When does twilight start
-    max_airmass     : What's the maximum airmass to consider
+    ----------
+    ra_deg : float
+        Right Ascension of the object in degrees
+    dec_deg : float
+        Declination of the object in degrees
+    do_observability : bool, default True
+        If True, calculate if the object is observable
+    SunElevation : float, default -18.0
+        Minimum Sun's elevation for astronomical twilight
+    max_airmass : float, default 2.0
+        Maximum acceptable airmass for the object to be observable
 
-    Return
-    ---------------
-    Dates_MMT, Dates_Magellan               : Time array for MMT and Magellan airmass graph
-    Airmass_MMT, Airmass_Magellan           : Airmass array of MMT and Magellan
-    SunElevation_MMT, SunElevation_Magellan : Sun Elevantion for each Time, to calculate twilight
-    MMT_observable, Magellan_observable     : Is the object visible from MMT and Magellan (True or False)
-    '''
+    Returns
+    -------
+    telescope_arrays : list
+        List of arrays containing the names of the telescopes
+        (MMT, Magellan, McDonald).
+    dates_arrays : list
+        List of arrays containing the time arrays
+        for all the telescopes.
+    airmasses_arrays : list
+        List of arrays containing the airmass arrays
+        for all the telescopes.
+    sun_elevations_arrays : list
+        List of arrays containing the sun elevation arrays
+        for all the telescopes.
+    observable_arrays : list
+        List of booleans indicating if the object is observable
+        from each telescope.
+    """
 
     # Convert coordinates to string format
-    coord     = SkyCoord(ra_deg, dec_deg, unit="deg")
-    coord_str = coord.to_string('hmsdms', sep = ':')
-    RA_str    = coord_str[:coord_str.find(' ')]
-    DEC_str   = coord_str[coord_str.find(' ')+1:]
+    coord = SkyCoord(ra_deg, dec_deg, unit="deg")
+    coord_str = coord.to_string('hmsdms', sep=':')
+    RA_str = coord_str[:coord_str.find(' ')]
+    DEC_str = coord_str[coord_str.find(' ')+1:]
 
     # Calculate airmass for MMT and Magellan
-    Dates_MMT,      Airmass_MMT,      SunElevation_MMT      = calc_airmass(RA_str, DEC_str, 'MMT'     , do_observability)
+    Dates_MMT, Airmass_MMT, SunElevation_MMT = calc_airmass(RA_str, DEC_str, 'MMT', do_observability)
     Dates_Magellan, Airmass_Magellan, SunElevation_Magellan = calc_airmass(RA_str, DEC_str, 'Magellan', do_observability)
+    Dates_McDonald, Airmass_McDonald, SunElevation_McDonald = calc_airmass(RA_str, DEC_str, 'McDonald', do_observability)
 
     # Calculate if the source will be observable from MMT and Magellan
     if do_observability:
-        MMT_observable      = is_it_observable(Airmass_MMT     , SunElevation_MMT     , SunElevation, max_airmass)
+        MMT_observable = is_it_observable(Airmass_MMT, SunElevation_MMT, SunElevation, max_airmass)
         Magellan_observable = is_it_observable(Airmass_Magellan, SunElevation_Magellan, SunElevation, max_airmass)
+        McDonald_observable = is_it_observable(Airmass_McDonald, SunElevation_McDonald, SunElevation, max_airmass)
     else:
-        MMT_observable      = '--'
-        Magellan_observable = '--'
+        MMT_observable = None
+        Magellan_observable = None
+        McDonald_observable = None
 
-    return Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan, MMT_observable, Magellan_observable
+    # Create and return the arrays
+    telescope_arrays = ['MMT', 'Magellan', 'McDonald']
+    dates_arrays = [Dates_MMT, Dates_Magellan, Dates_McDonald]
+    airmasses_arrays = [Airmass_MMT, Airmass_Magellan, Airmass_McDonald]
+    sun_elevations_arrays = [SunElevation_MMT, SunElevation_Magellan, SunElevation_McDonald]
+    observable_arrays = [MMT_observable, Magellan_observable, McDonald_observable]
 
-def plot_blackbody(sub_y, sub_x, sub_n, data_catalog, best_host):
-    '''
-    The the SED of the best host and a blackbody fit
+    return telescope_arrays, dates_arrays, airmasses_arrays, sun_elevations_arrays, observable_arrays
+
+
+def plot_nature_mag_distance(sub_y, sub_x, sub_n, data_catalog, info_table):
+    """
+    Plot the host magnitude as a function of distance from transient
+    And make the size equal to the probability of being a galaxy
 
     Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    data_catalog        : Astropy table with catalog data 
-    best_host           : Index of best host
-    '''
+    ----------
+    sub_y : int
+        Number of rows in the plot
+    sub_x : int
+        Number of columns in the plot
+    sub_n : int
+        Plot number
+    data_catalog : astropy.table.Table
+        Astropy table with catalog data
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    """
 
-    # Data to search for
-    filters_list     = np.array(['g'  , 'r'   , 'i'   , 'z'   , 'y'  , 'u'   , 'g'   , 'r'   , 'i'   , 'z'   ])
-    surveys_list     = np.array(['3pi', '3pi' , '3pi' , '3pi' , '3pi', 'sdss', 'sdss', 'sdss', 'sdss', 'sdss'])
-    zeropoints_list  = np.array([4.773e-9,2.897e-9,1.943e-9,1.452e-9,1.180e-9,8.423e-9,5.055e-9,2.904e-9,1.967e-9,1.375e-9])
-    wavelengths_list = np.array([4775.62,6129.53,7484.60,8657.82,9603.10,3594.90,4640.40,6122.30,7439.50,8897.10])
-    magnitudes_list  = np.array([float(get_kron_and_psf(i, j, data_catalog[best_host:best_host+1]              )[0]) for i, j in zip(filters_list, surveys_list)])
-    errors_list      = np.array([float(get_kron_and_psf(i, j, data_catalog[best_host:best_host+1], error = True)[0]) for i, j in zip(filters_list, surveys_list)])
-    flux_list        = 4*np.pi*zeropoints_list*10**(-0.4*magnitudes_list)
-    error_flux       = 2.5/np.log(10) * flux_list * errors_list
+    # Peak Transient magnitude
+    brightest_mag = info_table['brightest_mag'][0]
 
-    # Select Surveys
-    PI3   = np.where([surveys_list == '3pi'  ])[0]
-    SDSS  = np.where([surveys_list == 'sdss' ])[0]
-    MASS2 = np.where([surveys_list == '2mass'])[0]
-    WISE  = np.where([surveys_list == 'wise' ])[0]
+    # Get host information
+    host_separation = info_table['host_separation'][0]
+    host_magnitude = info_table['host_magnitude'][0]
+    host_nature = info_table['host_nature'][0]
 
-    # Check if there is data
-    PI3_exists   = np.nansum(magnitudes_list[PI3  ]) > 0
-    SDSS_exists  = np.nansum(magnitudes_list[SDSS ]) > 0
-    MASS2_exists = np.nansum(magnitudes_list[MASS2]) > 0
-    WISE_exists  = np.nansum(magnitudes_list[WISE ]) > 0
+    # Define x limit from search radius and zoom in if possible
+    search_radius = info_table['search_radius'][0]
+    half_radius = (search_radius * 60) / 2
+    if host_separation < half_radius:
+        search_radius_use = half_radius
+    else:
+        search_radius_use = search_radius * 60
 
-    # Plot
+    # Get separation and host magnitude
+    separations = data_catalog['separation']
+    magnitudes = data_catalog['effective_magnitude']
+    nature = data_catalog['object_nature']
+
+    # Get the ones for the closest host
+    closest_separation = info_table['closest_separation'][0]
+    closest_nature = info_table['closest_nature'][0]
+    closest_magnitude = info_table['closest_magnitude'][0]
+
+    # Plot data
     plt.subplot(sub_y, sub_x, sub_n)
-    if PI3_exists   : plt.errorbar(wavelengths_list[PI3  ], flux_list[PI3  ], error_flux[PI3  ], fmt = 'o', color = 'g',      alpha = 0.7, label = '3PI'  )
-    if SDSS_exists  : plt.errorbar(wavelengths_list[SDSS ], flux_list[SDSS ], error_flux[SDSS ], fmt = 'o', color = 'r',      alpha = 0.7, label = 'SDSS' )
-    if MASS2_exists : plt.errorbar(wavelengths_list[MASS2], flux_list[MASS2], error_flux[MASS2], fmt = 'o', color = 'orange', alpha = 0.7, label = '2MASS')
-    if WISE_exists  : plt.errorbar(wavelengths_list[WISE ], flux_list[WISE ], error_flux[WISE ], fmt = 'o', color = 'gray',   alpha = 0.7, label = 'WISE' )
+    plt.gca().invert_yaxis()
+    plt.title("Probability of being a Galaxy")
+    plt.scatter(separations, magnitudes, s=(nature + 0.1)*1000, c=(nature + 0.1)*1000, vmin=0, vmax=1000, alpha=0.75)
+    plt.scatter(host_separation, host_magnitude, marker='+', alpha=1.0, color='b', s=1000)
+    plt.axhline(brightest_mag, color='b', linestyle='--', linewidth=1, label="Brightest Mag=%s" % np.around(brightest_mag, decimals=2))
+    plt.axhline(host_magnitude, color='k', linestyle='-.', linewidth=1)
+    if host_separation < search_radius_use + 2:
+        plt.annotate(str(np.around(host_nature, decimals=2)), xy=(host_separation, host_magnitude))
+        if host_separation != closest_separation:
+            plt.annotate(str(np.around(closest_nature, decimals=2)), xy=(closest_separation, closest_magnitude))
+    plt.legend(loc='upper right', fancybox=True)
+    plt.xlim(0, search_radius_use + 2)
+    plt.xlabel("Distance from Transient [Arcsec]")
+    plt.ylabel("Effective Magnitude")
 
-    plt.legend(loc = 'upper right')
+
+def plot_host_mag_distance(sub_y, sub_x, sub_n, data_catalog, info_table):
+    """
+    Plot the host magnitude as a function of distance from transient
+    And make the size equal to the probability of being the host
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the plot
+    sub_x : int
+        Number of columns in the plot
+    sub_n : int
+        Plot number
+    data_catalog : astropy.table.Table
+        Astropy table with catalog data
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    """
+
+    # Get host nature
+    object_nature = data_catalog['object_nature']
+    star_cut = info_table['star_cut'][0]
+
+    # Separate galaxies and stars
+    galaxies = np.where(object_nature > star_cut)[0]
+    stars = np.where(object_nature <= star_cut)[0]
+
+    # Get catalog information
+    separations = data_catalog['separation']
+    magnitudes = data_catalog['effective_magnitude']
+    chance_coincidence = data_catalog['chance_coincidence']
+    brightest_mag = info_table['brightest_mag'][0]
+
+    # Get host information
+    host_separation = info_table['host_separation'][0]
+    host_magnitude = info_table['host_magnitude'][0]
+    host_Pcc = info_table['host_Pcc'][0]
+    closest_Pcc = info_table['closest_Pcc'][0]
+
+    # Get the ones for the closest host
+    closest_separation = info_table['closest_separation'][0]
+    closest_magnitude = info_table['closest_magnitude'][0]
+
+    # Define x limit from search radius and zoom in if possible
+    search_radius = info_table['search_radius'][0]
+    half_radius = (search_radius * 60) / 2
+    if host_separation < half_radius:
+        search_radius_use = half_radius
+    else:
+        search_radius_use = search_radius * 60
+
+    average_probability = 1 - chance_coincidence
+    host_probability = 1 - host_Pcc
+    closest_probability = 1 - closest_Pcc
+    plt.subplot(sub_y, sub_x, sub_n)
+    plt.gca().invert_yaxis()
+    plt.title("Probability of being the Host")
+    plt.scatter(separations[galaxies], magnitudes[galaxies], s=(average_probability[galaxies] + 0.1) * 1000,
+                c=(average_probability[galaxies] + 0.1) * 1000, vmin=0, vmax=1000, alpha=0.75)
+    plt.scatter(separations[stars], magnitudes[stars], s=100, c='r', marker='x', alpha=0.75, label='Stars')
+    plt.scatter(host_separation, host_magnitude, marker='+', alpha=1.0, color='b', s=1000)
+    plt.axhline(float(brightest_mag), color='b', linestyle='--', linewidth=1)
+    plt.axhline(float(host_magnitude), color='k', linestyle='-.', linewidth=1)
+    if host_separation < search_radius_use + 2:
+        if host_separation != closest_separation:
+            plt.annotate(str(np.around(closest_probability, decimals=2)), xy=(closest_separation, closest_magnitude))
+        plt.annotate(str(np.around(host_probability, decimals=2)), xy=(host_separation, host_magnitude))
+    plt.legend(loc='upper right', fancybox=True)
+    plt.xlim(0, search_radius_use + 2)
+    plt.xlabel("Distance from Transient [Arcsec]")
+    plt.ylabel("Effective Magnitude")
+
+
+def extract_probabilities(info_table):
+    """
+    Extract and organize classification probabilities from the info_table.
+
+    Parameters
+    ----------
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+
+    Returns
+    -------
+    prob_data : dict
+        Dictionary with classification probabilities for late, rapid_slsn, and rapid_tde
+    """
+    # Define classifier types and output classes
+    classifiers = ['late', 'rapid_slsn', 'rapid_tde']
+    classes = ['AGN', 'SLSNI', 'SLSNII', 'SNII', 'SNI', 'Star', 'TDE']
+
+    # Initialize results dictionary
+    results = {classifier: {'probs': [], 'stds': []} for classifier in classifiers}
+
+    # Process each classifier type
+    for classifier in classifiers:
+        # Map for combined classes
+        combined_classes = {
+            'SNII': ['SNII', 'SNIIb', 'SNIIn'],
+            'SNI': ['SNIa', 'SNIbc']
+        }
+
+        # Process each class
+        for class_name in classes:
+            # Direct probability extraction
+            if class_name in ['AGN', 'SLSNI', 'SLSNII', 'Star', 'TDE']:
+                col_name = f"P_{classifier}_{class_name}"
+                prob = info_table[col_name][0]
+                std = info_table[f"{col_name}_std"][0]
+
+            # Combined probability calculation
+            else:  # SNI or SNII
+                base_classes = combined_classes[class_name]
+                # Calculate combined probability
+                prob = sum(info_table[f"P_{classifier}_{bc}"][0] for bc in base_classes)
+
+                # Calculate combined standard deviation using error propagation
+                std = np.sqrt(sum(info_table[f"P_{classifier}_{bc}_std"][0]**2
+                                  for bc in base_classes))
+
+            results[classifier]['probs'].append(prob)
+            results[classifier]['stds'].append(std)
+
+    return {
+        'late': (results['late']['probs'], results['late']['stds']),
+        'slsn': (results['rapid_slsn']['probs'], results['rapid_slsn']['stds']),
+        'tde': (results['rapid_tde']['probs'], results['rapid_tde']['stds'])
+    }
+
+
+def plot_host_information(sub_y, sub_x, sub_n, info_table):
+    """
+    Make a plot with information about the transient and its host galaxy.
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the subplot grid.
+    sub_x : int
+        Number of columns in the subplot grid.
+    sub_n : int
+        Index of the current subplot.
+    """
+    # Empty array values to check against
+    emptys = ['', ' ', 'None', '--', '-', b'', b' ', b'None', b'--', b'-',
+              None, np.nan, 'nan', b'nan', '0', np.inf, 'inf']
+
+    # Format Names
+    object_name = info_table['object_name'][0]
+    ZTF_name = info_table['ztf_name'][0] if info_table['ztf_name'][0] not in emptys else ''
+    TNS_name = info_table['tns_name'][0] if info_table['tns_name'][0] not in emptys else ''
+
+    # Don't duplicate names
+    if object_name == ZTF_name:
+        ZTF_name = ''
+    if object_name == TNS_name:
+        TNS_name = ''
+
+    # Get classification
+    object_class = info_table['object_class'][0]
+
+    # Coordinates Info - with fixed precision
+    ra_deg = info_table['ra_deg'][0]
+    dec_deg = info_table['dec_deg'][0]
+    coords = SkyCoord(ra_deg, dec_deg, unit='deg')
+    coord_str = coords.to_string('hmsdms', sep=':')
+    RA_hms = coord_str[:coord_str.find(' ')][:12]
+    DEC_dms = coord_str[coord_str.find(' ')+1:][:12]
+    l_deg = coords.galactic.l.value
+    b_deg = coords.galactic.b.value
+
+    # Redshift Info
+    redshift = info_table['redshift_use'][0]
+    redshift_label = info_table['redshift_label'][0]
+
+    # Check for photoz information
+    photoz = None
+    photoz_err = None
+    if redshift_label != 'Photoz':
+        if info_table['photoz'][0] not in emptys:
+            photoz = float(info_table['photoz'][0])
+        if info_table['photoz_err'][0] not in emptys:
+            photoz_err = float(info_table['photoz_err'][0])
+
+    # Get classifier probabilities with proper error handling
+    try:
+        # Extract all probabilities with a single function call
+        prob_data = extract_probabilities(info_table)
+
+        # Unpack probability data
+        late_probs, late_stds = prob_data['late']
+        slsn_probs, slsn_stds = prob_data['slsn']
+        tde_probs, tde_stds = prob_data['tde']
+
+        has_probabilities = True
+    except Exception:
+        # Handle any errors in probability extraction
+        has_probabilities = False
+
+    # Create the plot
+    plt.subplot(sub_y, sub_x, sub_n)
+
+    # Center-align the object names with proper spacing
+    title = f"{object_name}"
+    if TNS_name:
+        title += f"     {TNS_name}"
+    if ZTF_name:
+        title += f"     {ZTF_name}"
+    plt.title(title)
+
+    # Build the text content
+    content = []
+
+    # Coordinates section - with fixed precision and aligned columns
+    content.append(f"RA = {RA_hms:<14}    DEC = {DEC_dms}")
+    content.append(f"   = {ra_deg:<14.6f}        = {dec_deg:.6f}")
+    content.append(f"l  = {l_deg:<14.6f}      b = {b_deg:.6f}")
+    content.append("")
+
+    # Classification and magnitude info
+    if object_class not in emptys:
+        content.append(f"{object_class}")
+
+    if info_table['hostless']:
+        content.append("Hostless!")
+
+    # Magnitude information
+    host_magnitude_r = info_table['host_magnitude_r'][0]
+    brightest_mag = info_table['brightest_mag'][0]
+    red_brightest = info_table['red_brightest'][0]
+    if red_brightest not in emptys:
+        content.append(f"ΔM = {host_magnitude_r:.2f} - {red_brightest:.2f} = {(host_magnitude_r - red_brightest):.2f}")
+    else:
+        content.append(f"ΔM = {host_magnitude_r:.2f} - {brightest_mag:.2f} = {(host_magnitude_r - brightest_mag):.2f}")
+
+    # Size and separation information
+    host_radius = info_table['host_radius'][0]
+    host_separation = info_table['host_separation'][0]
+    content.append(f"Size = {host_radius:.2f}\"")
+    content.append(f"Separation = {host_separation:.2f}\"")
+    content.append(f"Offset = {(host_separation/host_radius):.2f} Re")
+    content.append("")
+
+    # Light curve duration information
+    first_to_peak_r = info_table['first_to_peak_r'][0]
+    first_to_peak_g = info_table['first_to_peak_g'][0]
+    peak_to_last_r = info_table['peak_to_last_r'][0]
+    peak_to_last_g = info_table['peak_to_last_g'][0]
+
+    if first_to_peak_r > 80:
+        content.append(f"Warning, first to peak [r] = {first_to_peak_r:.2f} days")
+    if peak_to_last_r < -30:
+        content.append(f"Warning, peak to last [r] = {peak_to_last_r:.2f} days")
+    if first_to_peak_g > 120:
+        content.append(f"Warning, first to peak [g] = {first_to_peak_g:.2f} days")
+    if peak_to_last_g < -30:
+        content.append(f"Warning, peak to last [g] = {peak_to_last_g:.2f} days")
+    content.append("")
+
+    # Redshift information
+    absolute_magnitude = '--'
+    if redshift not in emptys:
+        redshift_float = float(redshift)
+        if np.isfinite(redshift_float):
+            content.append(f"z = {redshift_float:.3f} ({redshift_label})")
+            if redshift_float > 0:
+                if red_brightest not in emptys:
+                    absolute_magnitude = calc_absmag(red_brightest, redshift_float)
+                else:
+                    absolute_magnitude = calc_absmag(brightest_mag, redshift_float)
+
+    # Add photometric redshift if available
+    if photoz is not None and np.isfinite(photoz):
+        if photoz_err is not None:
+            content.append(f"z = {photoz:.3f}±{photoz_err:.3f} (photoz)")
+        else:
+            content.append(f"z = {photoz:.3f} (photoz)")
+
+    # Add absolute magnitude if available
+    if str(absolute_magnitude) not in emptys:
+        content.append(f"Abs. Mag = {float(absolute_magnitude):.2f}")
+    content.append("")
+
+    # Format probability table if available
+    if has_probabilities:
+        # Create a more compact header that matches the data rows
+        header = f"{'Class':4s} {'AGN':^4s} {'SLSNI':^4s} {'SLSNII':^4s} {'SNII':^4s} {'SNI':^5s} {'Star':^5s} {'TDE':^5s}"
+        content.append(header)
+        content.append("-" * len(header))
+
+        # Format the probability rows with tight spacing
+        def format_prob_row(name, probs, stds):
+            row = f"{name:2s}"
+            for p, s in zip(probs, stds):
+                if np.isfinite(p) and np.isfinite(s):
+                    row += f"{p:2.0f}±{s:<2.0f} "
+                elif np.isfinite(p):
+                    row += f"{p:2.0f}   "
+                else:
+                    row += "--    "
+            return row
+
+        # Add each probability row to content
+        content.append(format_prob_row("Late ", late_probs, late_stds))
+        content.append(format_prob_row("SLSN ", slsn_probs, slsn_stds))
+        content.append(format_prob_row("TDE  ", tde_probs, tde_stds))
+
+    # Remove axes and ticks
+    plt.tick_params(axis='both', left=False, top=False, right=False, bottom=False,
+                    labelleft=False, labeltop=False, labelright=False, labelbottom=False)
+
+    # Join all content with newlines and display as annotation
+    full_text = '\n'.join(content)
+    plt.annotate(full_text, xy=(0.02, 0.96), fontsize=10, va='top', family='monospace')
+
+    # Set plot limits
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+
+
+def calc_HET_observability(Dates, info_table, pupil_fraction=0.3):
+    """
+    Determine which dates are observable by HET.
+
+    Parameters
+    ----------
+    Dates : array
+        Array of dates to check for observability.
+    info_table : astropy.table.Table
+        Table with all the output FLEET information.
+    pupil_fraction : float, default 0.3
+        Fraction of the full pupil area that is considered observable.
+
+    Returns
+    -------
+    het_mask : array
+        Boolean array indicating which dates are observable by HET.
+    """
+    import pyHETobs
+    import contextlib
+
+    # Get object coordinates
+    ra_deg = info_table['ra_deg'][0]
+    dec_deg = info_table['dec_deg'][0]
+
+    # Set up target object
+    target = SkyCoord(ra_deg, dec_deg, unit=(u.deg, u.deg), frame='icrs')
+
+    # McDonald Observatory location
+    Obslocation = EarthLocation.of_site(u'mcdonald')
+    mcdonald_longitude = -104.02166669 * u.deg  # Longitude of McDonald Observatory
+    full_pupil_area = 78.8083117443839  # Full area of HET's pupil
+
+    # Pick a time near the middle of the night at UT = 10
+    mid_date = Time(Dates[-1].replace(hour=10, minute=0, second=0, microsecond=0))
+
+    # Calculate the time of the zenith crossing
+    HA_toStar = mid_date.sidereal_time('apparent', longitude=mcdonald_longitude) - target.ra
+    ZenithCrossTime = mid_date - HA_toStar.hour * u.hour
+
+    # Calculate the optimal azimuth to park the telescope
+    optimal_azimuth_east, _, _ = pyHETobs.HET_Tracker.find_HET_optimal_azimuth(target, ZenithCrossTime, True)
+    optimal_azimuth_west, _, _ = pyHETobs.HET_Tracker.find_HET_optimal_azimuth(target, ZenithCrossTime, False)
+
+    # Suppress any output from pyHETobs
+    print('Calculating HET observability ...')
+    with contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
+        # Setup the HET telescope
+        HET_east = pyHETobs.TrackPupilSize.HET_Telescope(park_azimuth=optimal_azimuth_east)
+        HET_west = pyHETobs.TrackPupilSize.HET_Telescope(park_azimuth=optimal_azimuth_west)
+
+    # Empty variable
+    max_area = np.zeros(len(Dates), dtype=bool)
+
+    for i in range(len(Dates)):
+        obs_time = Dates[i]
+        # Calcualte the object's altitude and azimuth
+        ObjAltAz = target.transform_to(AltAz(obstime=obs_time, location=Obslocation))
+
+        # Calculate the effective pupil area
+        east_pupil = HET_east.get_effective_pupil(ObjAltAz)
+        west_pupil = HET_west.get_effective_pupil(ObjAltAz)
+        east_pupil_area = east_pupil.area
+        west_pupil_area = west_pupil.area
+
+        max_area[i] = np.max([east_pupil_area, west_pupil_area])
+
+    # Create mask
+    het_mask = np.zeros(len(Dates), dtype=bool)
+    het_mask[max_area > full_pupil_area * pupil_fraction] = True
+
+    return het_mask
+
+
+def plot_observability(sub_y, sub_x, sub_n, info_table, telescope_arrays, dates_arrays, airmasses_arrays, sun_elevations_arrays,
+                       include_het=False, pupil_fraction=0.3):
+    """
+    Plot airmass graphs of a given object for MMT and Magellan
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the subplot
+    sub_x : int
+        Number of columns in the subplot
+    sub_n : int
+        Subplot number
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    telescope_arrays : list
+        List of telescope names
+    dates_arrays : list
+        List of dates for each telescope
+    airmasses_arrays : list
+        List of airmasses for each telescope
+    sun_elevations_arrays : list
+        List of sun elevations for each telescope
+    include_het : bool, default False
+        If True, calculate observability specifically for HET
+    """
+
+    # Airmass plots
+    axes = plt.subplot(sub_y, sub_x, sub_n)
+    plt.gca().invert_yaxis()
+
+    # Default colors for the plots
+    colors = ['g', 'r', 'b', 'k', 'm', 'c', 'y']
+
+    for i in range(len(telescope_arrays)):
+        Telescope = telescope_arrays[i]
+        Dates = dates_arrays[i]
+        Airmass = airmasses_arrays[i]
+        SunElevation = sun_elevations_arrays[i]
+
+        # Plot the airmass
+        if (Telescope != 'McDonald') or (not include_het):
+            plt.plot(Dates, Airmass, color=colors[i], linewidth=4, label='%s Airmass' % telescope_arrays[i])
+            plt.fill_between(Dates, 0, 3.0, where=SunElevation <= -18.0, facecolor=colors[i], alpha=0.25)
+        elif Telescope == 'McDonald':
+            het_mask = calc_HET_observability(Dates, info_table, pupil_fraction)
+            airmass_true = np.copy(Airmass)
+            airmass_true[~het_mask] = np.nan
+            plt.plot(Dates, Airmass, color=colors[i], linewidth=1, linestyle='--')
+            plt.plot(Dates, airmass_true, color=colors[i], linewidth=4, label='%s Airmass' % telescope_arrays[i])
+            plt.fill_between(Dates, 0, 3.0, where=SunElevation <= -18.0, facecolor=colors[i], alpha=0.25)
+
+    plt.fill_between([], [], facecolor='gray', alpha=0.25, label='Night')
+    plt.legend(loc='upper left')
+    plt.ylabel("Airmass")
+    plt.title("UT=%s" % datetime.datetime.now().strftime('%Y-%m-%d') + "     MJD=%s" % np.around(Time(datetime.datetime.now()).mjd, decimals=1))
+    plt.ylim(3, 0.5)
+    # Calculate the minimum and maximum dates
+    min_date = Dates[0].replace(hour=17, minute=0, second=0, microsecond=0)
+    max_date = min_date + datetime.timedelta(hours=23)
+    plt.xlim(min_date, max_date)
+
+    # Change Axes Labels
+    plt.xticks(rotation=0)
+    axes.set_xticks([min_date + datetime.timedelta(hours=i) for i in range(0, 24, 2)])
+    xfmt = md.DateFormatter('%H')
+    axes.xaxis.set_major_formatter(xfmt)
+    plt.xlabel('UT')
+
+
+def plot_ra_dec_size(sub_y, sub_x, sub_n, data_catalog, info_table):
+    """
+    Plot the field objects in RA and DEC, where the size
+    is the size of the objects
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the plot
+    sub_x : int
+        Number of columns in the plot
+    sub_n : int
+        Plot number
+    data_catalog : astropy.table.Table
+        Astropy table with catalog data
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    """
+
+    # Calculate the transient luminosity
+    brightest_mag = info_table['brightest_mag'][0]
+    Lum_Transient = 10 ** 9 * (10 ** (-0.4 * float(brightest_mag)))
+
+    # Get catalog information
+    objects_ra = data_catalog['ra_matched']
+    objects_dec = data_catalog['dec_matched']
+    separation = data_catalog['separation']
+    output_nature = data_catalog['object_nature']
+    halflight_radius = data_catalog['halflight_radius']
+
+    # Get host information
+    search_radius = info_table['search_radius'][0]
+    ra_deg = info_table['ra_deg'][0]
+    dec_deg = info_table['dec_deg'][0]
+    host_ra = info_table['host_ra'][0]
+    host_dec = info_table['host_dec'][0]
+
+    # Within radius
+    within = (separation < search_radius * 60)
+    plt.subplot(sub_y, sub_x, sub_n)
+    plt.gca().invert_xaxis()
+    plt.title("Probability of being a Galaxy (Size)")
+    plt.scatter(objects_ra[within], objects_dec[within], s=(output_nature[within] + 0.1)*1000, c=(output_nature[within] + 0.1)*1000,
+                vmin=0, vmax=1000, alpha=0.75)
+    plt.scatter(ra_deg, dec_deg, marker='*', color='r', s=Lum_Transient)
+    plt.scatter(host_ra, host_dec, marker='+', alpha=1.0, color='b', s=1000)
+    plt.xlabel("RA")
+    plt.ylabel("DEC")
+    plt.ticklabel_format(useOffset=False)
+    plt.xticks(np.round(plt.xticks()[0], 2), rotation=0)
+    plt.yticks(np.round(plt.yticks()[0], 2))
+    correction = np.cos(np.radians(dec_deg))
+    plt.xlim(ra_deg + search_radius / 60 / correction, ra_deg - search_radius / 60 / correction)
+    plt.ylim(dec_deg - search_radius / 60, dec_deg + search_radius / 60)
+    for j in range(len(objects_ra[within])):
+        if np.isfinite(halflight_radius[within][j]):
+            plt.annotate(str(np.around(halflight_radius[within][j], decimals=2)), xy=(objects_ra[within][j], objects_dec[within][j]))
+
+
+def plot_ra_dec_magnitude(sub_y, sub_x, sub_n, data_catalog, info_table):
+    """
+    Plot the field objects in RA and DEC, where the size
+    is the magnitude of the objects
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the plot
+    sub_x : int
+        Number of columns in the plot
+    sub_n : int
+        Plot number
+    data_catalog : astropy.table.Table
+        Astropy table with catalog data
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    """
+
+    # Get catalog information
+    objects_ra = data_catalog['ra_matched']
+    objects_dec = data_catalog['dec_matched']
+    hosts_magnitudes = data_catalog['effective_magnitude']
+
+    # Get host information
+    ra_deg = info_table['ra_deg'][0]
+    dec_deg = info_table['dec_deg'][0]
+    host_ra = info_table['host_ra'][0]
+    host_dec = info_table['host_dec'][0]
+    search_radius = info_table['search_radius'][0]
+    brightest_mag = info_table['brightest_mag'][0]
+
+    Lum_Transient = 10 ** 9 * (10 ** (-0.4 * float(brightest_mag)))
+    Lum = 10 ** 9 * (10 ** (-0.4 * hosts_magnitudes))
+
+    plt.subplot(sub_y, sub_x, sub_n)
+    plt.gca().invert_xaxis()
+    plt.title("Magnitude")
+    plt.scatter(objects_ra, objects_dec, s=40 * Lum, c=Lum, alpha=0.75)
+    plt.scatter(ra_deg, dec_deg, marker='*', color='r', s=Lum_Transient)
+    plt.scatter(host_ra, host_dec, marker='+', alpha=1.0, color='b', s=1000, label='Best Host')
+    plt.legend(loc='upper right')
+    plt.xlabel("RA")
+    plt.xticks(np.round(plt.xticks()[0], 2), rotation=0)
+    plt.yticks(np.round(plt.yticks()[0], 2))
+    correction = np.cos(np.radians(dec_deg))
+    plt.xlim(ra_deg + search_radius / 60 / correction, ra_deg - search_radius / 60 / correction)
+    plt.ylim(dec_deg - search_radius / 60, dec_deg + search_radius / 60)
+    plt.ticklabel_format(useOffset=False)
+
+
+def plot_field_image(sub_y, sub_x, sub_n, info_table, image_color='r', autoscale=75,
+                     images_dir='images'):
+    """
+    Plot the field image at the given RA and DEC from 3PI
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the subplot
+    sub_x : int
+        Number of columns in the subplot
+    sub_n : int
+        Plot number in the subplot
+    info_table : astropy.table.Table
+        Table containing the transient info
+    image_color : str, default 'r'
+        Filter name for the image
+    autoscale : int, default 75
+        PS1 scaling (lower is more contrast)
+    """
+
+    # Create folder to store images, if it doesn't exist
+    os.makedirs(images_dir, exist_ok=True)
+
+    # Get transient information
+    object_name = info_table['object_name'][0]
+    ra_deg = info_table['ra_deg'][0]
+    dec_deg = info_table['dec_deg'][0]
+    search_radius = info_table['search_radius'][0]
+
+    # If the image exists, open it
+    wcs_size = int(search_radius * 2 * 60)
+    image_name = f'{images_dir}/{object_name}.jpeg'
+    if not os.path.exists(image_name):
+        img = query_PS1_image(ra_deg, dec_deg, image_color, wcs_size, autoscale)
+        try:
+            img.save(image_name, 'jpeg')
+        except Exception:
+            pass
+    else:
+        img = Image.open(image_name)
+
+    # Plot the image
+    plt.subplot(sub_y, sub_x, sub_n)
+    plt.tick_params(axis='both', left=False, top=False, right=False, bottom=False, labelleft=False, labeltop=False, labelright=False, labelbottom=False)
+    if img == '--':
+        plt.annotate('Outside PS1 footprint', xy=(0, 0))
+        plt.set_xlim(-0.5, 1)
+        plt.set_ylim(-1, 1)
+    else:
+        plt.imshow(np.array(img), cmap='viridis')
+
+    # Plot center
+    plt.scatter(wcs_size*2, wcs_size*2, marker='+', color='r')
+
+
+def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase=0, add_phase=0,
+                    plot_model=True, full_range=False, plot_comparison=True):
+    """
+    Plot the light curve and model for a given transient
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the subplot
+    sub_x : int
+        Number of columns in the subplot
+    sub_n : int
+        Subplot number
+    input_table : astropy.table.Table
+        Data with photometry
+    info_table : astropy.table.Table
+        Data with information about the transient
+    subtract_phase : float, default 0
+        Days to subtract from minimum x limit
+    add_phase : float, default 0
+        Days to add to maximum x limit
+    plot_model : bool, default True
+        If True, plot the model
+    full_range : bool, default False
+        If True, plot the entire photometry (True), or just
+        the relevant portion (False)
+    plot_comparison : bool, default True
+        If True, plot a comparison Ia light curve
+
+    Returns
+    -------
+    used_filters : list
+        List of filters used in the plot
+    used_sources : list
+        List of sources used in the plot
+    """
+
+    # Get transient information
+    first_mjd = info_table['first_mjd'][0]
+    bright_mjd = info_table['bright_mjd'][0]
+
+    # Extract light curve data
+    all_magnitudes = input_table['Mag']
+    all_times = input_table['MJD']
+    all_sigmas = input_table['MagErr']
+    all_filters = input_table['Filter']
+    all_sources = input_table['Source']
+    all_upperlimits = input_table['UL']
+    all_ignores = input_table['Ignore']
+    # If plotting the full range, use MJD as phase
+    if full_range:
+        all_phases = all_times
+    else:
+        all_phases = all_times - bright_mjd
+
+    # Which are Upper limits and ignored data
+    upper_limit = np.where((all_upperlimits == 'True') & (all_ignores == 'False'))[0]
+    detection = np.where((all_upperlimits == 'False') & (all_ignores == 'False'))[0]
+    # Ignored
+    upper_ignore = np.where((all_upperlimits == 'True') & (all_ignores == 'True'))[0]
+    detect_ignore = np.where((all_upperlimits == 'False') & (all_ignores == 'True'))[0]
+
+    # Select Plot Colors
+    all_colors = plot_colors(all_filters)
+
+    # Select groups of Data (detectiond and upper limits)
+    is_det_ztf = np.flatnonzero(np.isin(all_sources[detection], ['ZTF', 'Alerce']))
+    is_det_local = np.flatnonzero(np.isin(all_sources[detection], ['Local', 'FLWO']))
+    is_det_other = np.where(~np.isin(all_sources[detection], ['ZTF', 'Local', 'FLWO']))[0]
+
+    # Set plot limits to ± 0.5 the magnitude limits
+    if full_range:
+        real_magnitudes = all_magnitudes[np.isfinite(all_magnitudes)]
+    else:
+        real_magnitudes = all_magnitudes[detection][np.isfinite(all_magnitudes[detection])]
+
+    # Set Phase Limits
+    # Minimum
+    brightest_phase = bright_mjd - first_mjd
+    if brightest_phase > 100:
+        MJD_minimum = bright_mjd - 100
+    else:
+        MJD_minimum = first_mjd - 5
+    phase_minimum = MJD_minimum - bright_mjd
+
+    # Maximum
+    latest_phase = np.nanmax(all_phases[detection])
+    latest_mjd = np.nanmax(all_times[detection])
+    if latest_phase >= 30:
+        MJD_maximum = latest_mjd + 5
+    else:
+        MJD_maximum = latest_mjd + 35
+    phase_maximum = MJD_maximum - bright_mjd
+
+    # Set up plot
+    plt.subplot(sub_y, sub_x, sub_n)
+    plt.gca().invert_yaxis()
+    plt.ylim(np.nanmax(real_magnitudes) + 0.5, np.nanmin(real_magnitudes) - 0.5)
+
+    # Include offsets if specified
+    if full_range:
+        mino, maxo = np.nanmin(all_times), np.nanmax(all_times)
+    else:
+        mino, maxo = phase_minimum - subtract_phase, phase_maximum + add_phase
+
+    # Making sure the min and max are not the same, otherwise who cares
+    if mino != maxo:
+        plt.xlim(mino, maxo)
+
+    # Plot detections
+    plt.errorbar(all_phases[detection][is_det_ztf], all_magnitudes[detection][is_det_ztf], all_sigmas[detection][is_det_ztf],
+                 ecolor=all_colors[detection][is_det_ztf], fmt='d', alpha=0.8, ms=0)
+    plt.errorbar(all_phases[detection][is_det_local], all_magnitudes[detection][is_det_local], all_sigmas[detection][is_det_local],
+                 ecolor=all_colors[detection][is_det_local], fmt='*', alpha=0.8, ms=0)
+    plt.errorbar(all_phases[detection][is_det_other], all_magnitudes[detection][is_det_other], all_sigmas[detection][is_det_other],
+                 ecolor=all_colors[detection][is_det_other], fmt='.', alpha=0.8, ms=0)
+    plt.scatter(all_phases[detection][is_det_ztf], all_magnitudes[detection][is_det_ztf],
+                color=all_colors[detection][is_det_ztf], marker='d', alpha=0.8, s=90)
+    plt.scatter(all_phases[detection][is_det_local], all_magnitudes[detection][is_det_local],
+                color=all_colors[detection][is_det_local], marker='*', alpha=0.8, s=90)
+    plt.scatter(all_phases[detection][is_det_other], all_magnitudes[detection][is_det_other],
+                color=all_colors[detection][is_det_other], marker='.', alpha=0.8, s=90)
+
+    # Plot upper limits
+    ul_alpha = 0.5
+    plt.scatter(all_phases[upper_limit], all_magnitudes[upper_limit],
+                color=all_colors[upper_limit], marker='v', alpha=ul_alpha, s=90)
+
+    # Plot Ignored Data
+    ignore_alpha = 0.15
+    # Select groups of Data (detectiond and upper limits)
+    was_det_ztf = np.flatnonzero(np.isin(all_sources[detect_ignore], ['ZTF', 'Alerce']))
+    was_det_local = np.flatnonzero(np.isin(all_sources[detect_ignore], ['Local', 'FLWO']))
+    was_det_other = np.where(~np.isin(all_sources[detect_ignore], ['ZTF', 'Local', 'FLWO']))[0]
+
+    # Plot ignored detections
+    plt.errorbar(all_phases[detect_ignore][was_det_ztf], all_magnitudes[detect_ignore][was_det_ztf], all_sigmas[detect_ignore][was_det_ztf],
+                 ecolor=all_colors[detect_ignore][was_det_ztf], fmt='d', alpha=ignore_alpha, ms=0)
+    plt.errorbar(all_phases[detect_ignore][was_det_local], all_magnitudes[detect_ignore][was_det_local], all_sigmas[detect_ignore][was_det_local],
+                 ecolor=all_colors[detect_ignore][was_det_local], fmt='*', alpha=ignore_alpha, ms=0)
+    plt.errorbar(all_phases[detect_ignore][was_det_other], all_magnitudes[detect_ignore][was_det_other], all_sigmas[detect_ignore][was_det_other],
+                 ecolor=all_colors[detect_ignore][was_det_other], fmt='.', alpha=ignore_alpha, ms=0)
+    plt.scatter(all_phases[detect_ignore][was_det_ztf], all_magnitudes[detect_ignore][was_det_ztf],
+                color=all_colors[detect_ignore][was_det_ztf], marker='d', alpha=ignore_alpha, s=90)
+    plt.scatter(all_phases[detect_ignore][was_det_local], all_magnitudes[detect_ignore][was_det_local],
+                color=all_colors[detect_ignore][was_det_local], marker='*', alpha=ignore_alpha, s=90)
+    plt.scatter(all_phases[detect_ignore][was_det_other], all_magnitudes[detect_ignore][was_det_other],
+                color=all_colors[detect_ignore][was_det_other], marker='.', alpha=ignore_alpha, s=90)
+
+    # Plot ignored upper limits
+    plt.scatter(all_phases[upper_ignore], all_magnitudes[upper_ignore],
+                color=all_colors[upper_ignore], marker='v', alpha=ignore_alpha, s=90)
+
+    # Set Axis Labels
+    if full_range:
+        plt.tick_params(axis='both', top=False, bottom=True, labeltop=False, labelbottom=True)
+        plt.xlabel('MJD')
+    else:
+        plt.tick_params(axis='both', top=False, bottom=True, labeltop=False, labelbottom=True)
+        plt.xlabel('Days Since Brightest Point')
+
+    plt.ylabel('Magnitude')
+
+    # Get filter information
+    used_filters, used_sources = np.unique(all_filters), np.unique(all_sources)
+
+    # Define filter references and colors
+    # Define filter references for LSST and ZTF
+    if 'LSST' in used_sources:
+        wavelengths = np.array([lsst_refs[i] for i in used_filters])
+    elif ('ZTF' in used_sources) or ('Alerce' in used_sources):
+        wavelengths = np.array([ztf_refs[i] for i in used_filters])
+    else:
+        raise ValueError("Unknown telescope in data. Please check the input table.")
+
+    # Plot fits to the data
+    if plot_model and not full_range:
+        # Get model
+        model = info_table['model'][0]
+
+        if (model == 'double') or (model == 'single'):
+            # Get model parameters
+            lc_width_r = info_table['lc_width_r'][0]
+            lc_decline_r = info_table['lc_decline_r'][0]
+            phase_offset_r = info_table['phase_offset_r'][0]
+            mag_offset_r = info_table['mag_offset_r'][0]
+            lc_width_g = info_table['lc_width_g'][0]
+            lc_decline_g = info_table['lc_decline_g'][0]
+            phase_offset_g = info_table['phase_offset_g'][0]
+            mag_offset_g = info_table['mag_offset_g'][0]
+
+            # Create model
+            model_time = np.linspace(-100, 200, 1000)
+            if lc_width_r:
+                model_red = linex(model_time, lc_width_r, lc_decline_r, phase_offset_r, mag_offset_r)
+                plt.plot(model_time, model_red, color='r', linestyle=':', linewidth=0.5)
+            if lc_width_g:
+                model_green = linex(model_time, lc_width_g, lc_decline_g, phase_offset_g, mag_offset_g)
+                plt.plot(model_time, model_green, color='g', linestyle=':', linewidth=0.5)
+
+        elif model == 'full':
+            # Get model parameters
+            lc_width = info_table['lc_width'][0]
+            lc_decline = info_table['lc_decline'][0]
+            phase_offset = info_table['phase_offset'][0]
+            mag_offset = info_table['mag_offset'][0]
+            initial_temp = info_table['initial_temp'][0]
+            cooling_rate = info_table['cooling_rate'][0]
+
+            # Plot the light curve for each filter
+            model_time = np.linspace(-100, 200, 1000)
+            if lc_width:
+                for filter_name, filter_wave in zip(used_filters, wavelengths):
+                    # Plot the model
+                    model_data = model_mag(model_time, filter_wave, lc_width, lc_decline,
+                                           phase_offset, mag_offset, initial_temp, cooling_rate)
+                    plt.plot(model_time, model_data, color=filter_colors[filter_name], linestyle=':', linewidth=0.5)
+
+        # Add chi^2 legend
+        chi2 = info_table['chi2'][0]
+        if isinstance(chi2, (int, float)) and np.isfinite(chi2):
+            plt.plot([], [], color='k', linestyle=':', linewidth=0.5, label=r'$\chi^2 = %s$' % round(chi2, 2))
+            plt.legend(loc='upper right')
+
+    # Plot comparison SN Ia
+    brightest_mag = info_table['brightest_mag'][0]
+    if plot_comparison and not full_range and brightest_mag:
+        plt.plot(phase_1a_model_r, magnitude_1a_model_r + brightest_mag, color='m', linestyle='--', linewidth=1)
+
+    if not full_range:
+        return used_filters, used_sources
+
+
+def plot_host_sed(sub_y, sub_x, sub_n, data_catalog, info_table):
+    """
+    Plot the SED of the best host galaxy.
+
+    Parameters
+    ----------
+    sub_y : int
+        Number of rows in the subplot
+    sub_x : int
+        Number of columns in the subplot
+    sub_n : int
+        Index of the subplot
+    data_catalog : astropy.table.Table
+        Catalog of objects in field
+    info_table : astropy.table.Table
+        Table with information about the best host
+    """
+
+    # Get best host index
+    best_host = info_table['best_host'][0]
+
+    # Flux conversion factor
+    Jy = 10 ** (8.9 / 2.5) * u.Jy
+    plt.subplot(sub_y, sub_x, sub_n)
+
+    # If there is 3pi data, plot it
+    if 'gKronMag_3pi' in data_catalog.colnames:
+        # Get the best host index
+        best_host = info_table['best_host'][0]
+
+        # Get the data for the best host
+        magnitudes = np.array([data_catalog[best_host]['gKronMag_3pi'],
+                              data_catalog[best_host]['rKronMag_3pi'],
+                              data_catalog[best_host]['iKronMag_3pi'],
+                              data_catalog[best_host]['zKronMag_3pi'],
+                              data_catalog[best_host]['yKronMag_3pi']])
+        errors = np.array([data_catalog[best_host]['gKronMagErr_3pi'],
+                           data_catalog[best_host]['rKronMagErr_3pi'],
+                           data_catalog[best_host]['iKronMagErr_3pi'],
+                           data_catalog[best_host]['zKronMagErr_3pi'],
+                           data_catalog[best_host]['yKronMagErr_3pi']])
+        wavelengths = np.array(list(psst_refs.values()))
+        flux = 10 ** (-0.4 * magnitudes) * Jy.value * 1000
+        flux_err = flux * (10 ** (0.4 * errors) - 1)
+
+        plt.errorbar(wavelengths, flux, flux_err, fmt='o', color='c', alpha=0.7, label='3PI')
+    if 'modelMag_g_sdss' in data_catalog.colnames:
+        # Get the data for the best host
+        magnitudes = np.array([data_catalog[best_host]['modelMag_u_sdss'],
+                               data_catalog[best_host]['modelMag_g_sdss'],
+                               data_catalog[best_host]['modelMag_r_sdss'],
+                               data_catalog[best_host]['modelMag_i_sdss'],
+                               data_catalog[best_host]['modelMag_z_sdss']])
+        errors = np.array([data_catalog[best_host]['modelMagErr_u_sdss'],
+                           data_catalog[best_host]['modelMagErr_g_sdss'],
+                           data_catalog[best_host]['modelMagErr_r_sdss'],
+                           data_catalog[best_host]['modelMagErr_i_sdss'],
+                           data_catalog[best_host]['modelMagErr_z_sdss']])
+        wavelengths = np.array(list(sdss_refs.values()))
+        flux = 10 ** (-0.4 * magnitudes) * Jy.value * 1000
+        flux_err = flux * (10 ** (0.4 * errors) - 1)
+
+        plt.errorbar(wavelengths, flux, flux_err, fmt='o', color='orange', alpha=0.7, label='SDSS')
+
+    # Setup plot
+    plt.legend(loc='upper right')
     plt.title('Best Host SED')
-    plt.xlim(2900, 260000)
-    plt.xscale('log')
-    plt.yscale('log')
+    plt.xlim(2500, 13000)
+    plt.ylim(ymin=0)
     plt.xlabel('Wavelength [\u212b]')
-    plt.ylabel('Flux')
+    plt.ylabel('Flux [mJy]')
 
-def plot_coordinates(sub_y, sub_x, sub_n, ra_deg, dec_deg, data_catalog, closest, acceptance_boxsize = 1.5):
-    '''
+
+def plot_coordinates(sub_y, sub_x, sub_n, data_catalog, info_table, acceptance_boxsize=1.5):
+    """
     Plot the closest area and the coordinates of all the catalogs of the closest object.
 
     Parameters
-    ---------------
-    sub_y, sub_x, sub_n : Subplot parameters (rows, columns, plot number)
-    ra_deg, dec_deg     : Coordiantes of the star in degrees
-    data_catalog        : Catalog of objects in field
-    closest             : Index of the best host
-    acceptance_boxsize  : Objects inside this box were matched in catalog (arcsec)
-    '''
+    ----------
+    sub_y : int
+        Number of rows in the subplot
+    sub_x : int
+        Number of columns in the subplot
+    sub_n : int
+        Index of the subplot
+    data_catalog : astropy.table.Table
+        Catalog of objects in field
+    info_table : astropy.table.Table
+        Table with information about the best host
+    acceptance_boxsize : float
+        Objects inside this box were matched in catalog (arcsec)
+    """
 
-    # Get RA and DEC from the target
-    target   = data_catalog[closest]
-    all_ras  = flot(target['ra_matched'])
-    all_decs = flot(target['dec_matched'])
+    # Get RA and DEC from the host
+    closest_ra = info_table['closest_ra'][0]
+    closest_dec = info_table['closest_dec'][0]
 
-    # If Gaia coordinates exist, use those above all others
-    if 'RA_ICRS_gaia' in target.colnames:
-        ra_gaia  = flot(target['RA_ICRS_gaia'])
-        dec_gaia = flot(target['DE_ICRS_gaia'])
+    # Get RA and DEC from the transient
+    ra_deg = info_table['ra_deg'][0]
+    dec_deg = info_table['dec_deg'][0]
 
-        if np.isfinite(ra_gaia):
-            # Replace values
-            all_ras  = ra_gaia 
-            all_decs = dec_gaia
+    # Calculate separate separations
+    delta_ra, delta_dec = calc_separations(ra_deg, dec_deg, closest_ra, closest_dec, separate=True)
 
     # Plot data
     plt.subplot(sub_y, sub_x, sub_n)
     # Offset
     o = acceptance_boxsize / 3600 / 2
     # plot square region
-    x_box = np.array([ all_ras - o,  all_ras + o,  all_ras + o,  all_ras - o,  all_ras - o])
-    y_box = np.array([all_decs - o, all_decs - o, all_decs + o, all_decs + o, all_decs - o])
-    plt.plot((x_box - all_ras) * 3600, (y_box - all_decs) * 3600, color = 'b', linewidth = 1, alpha = 0.5)
+    x_box = np.array([closest_ra - o, closest_ra + o, closest_ra + o, closest_ra - o, closest_ra - o])
+    y_box = np.array([closest_dec - o, closest_dec - o, closest_dec + o, closest_dec + o, closest_dec - o])
+    plt.plot((x_box - closest_ra) * 3600, (y_box - closest_dec) * 3600, color='b', linewidth=1, alpha=0.5)
 
     plt.title('Closest Host')
-    plt.scatter((all_ras - all_ras) * 3600, (all_decs - all_decs) * 3600, marker = '+', color = 'b', s = 90 , alpha = 0.5, zorder = 10, label = 'Joint' )
-    plt.scatter((ra_deg  - all_ras) * 3600, (dec_deg  - all_decs) * 3600, marker = '*', color = 'b', s = 200, alpha = 0.7,              label = 'Target')
-    # Calculate Errorbars
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        if 'errMaj_2mass'  in data_catalog.colnames: err_2mass = np.nanmean([np.array(target['errMaj_2mass']).astype(float), np.array(target['errMin_2mass']).astype(float)], axis = 0) / 3600
-        if 'eeMaj_wise'    in data_catalog.colnames: err_wise  = np.nanmean([np.array(target['eeMaj_wise']).astype(float), np.array(target['eeMin_wise']).astype(float)], axis = 0) / 3600
-    # Plot Locations
-    if 'raStack_3pi'   in data_catalog.colnames: plt.errorbar((np.array(target   ['raStack_3pi'   ]).astype(float) - all_ras) * 3600, (np.array(target  ['decStack_3pi'  ]).astype(float) - all_decs) * 3600, xerr = np.array(target['raStackErr_3pi']).astype(float)      , yerr = np.array(target['decStackErr_3pi']).astype(float)    , alpha = 0.5, color = 'g',      fmt = 'o', label = '3PI'   )
-    if 'ra_sdss'       in data_catalog.colnames: plt.errorbar((np.array(target   ['ra_sdss'       ]).astype(float) - all_ras) * 3600, (np.array(target  ['dec_sdss'      ]).astype(float) - all_decs) * 3600, xerr = np.array(target['raErr_sdss'    ]).astype(float)      , yerr = np.array(target['decErr_sdss'    ]).astype(float)    , alpha = 0.5, color = 'r',      fmt = 'o', label = 'SDSS'  )
-    if 'RAJ2000_2mass' in data_catalog.colnames: plt.errorbar((np.array(target   ['RAJ2000_2mass' ]).astype(float) - all_ras) * 3600, (np.array(target  ['DEJ2000_2mass' ]).astype(float) - all_decs) * 3600, xerr = err_2mass * 3600                                      , yerr = err_2mass * 3600                                     , alpha = 0.5, color = 'orange', fmt = 'o', label = '2MASS' )
-    if 'RAJ2000_wise'  in data_catalog.colnames: plt.errorbar((np.array(target   ['RAJ2000_wise'  ]).astype(float) - all_ras) * 3600, (np.array(target  ['DEJ2000_wise'  ]).astype(float) - all_decs) * 3600, xerr = err_wise  * 3600                                      , yerr = err_wise  * 3600                                     , alpha = 0.5, color = 'gray',   fmt = 'o', label = 'WISE'  )
-    if 'RA_ICRS_gaia'  in data_catalog.colnames: plt.errorbar((np.array(target   ['RA_ICRS_gaia'  ]).astype(float) - all_ras) * 3600, (np.array(target  ['DE_ICRS_gaia'  ]).astype(float) - all_decs) * 3600, xerr = np.array(target['e_RA_ICRS_gaia']).astype(float)/1000 , yerr = np.array(target['e_DE_ICRS_gaia']).astype(float)/1000, alpha = 0.5, color = 'C0',     fmt = 'o', label = 'Gaia'  )
-    plt.legend(loc = 'best')
-    plt.xlim(- 1, + 1)
-    plt.ylim(- 1, + 1)
+    plt.scatter(0, 0, marker='+', color='b', s=90, alpha=0.5, zorder=10, label='Joint')
+    plt.scatter(delta_ra, delta_dec, marker='*', color='b', s=200, alpha=0.7, label='Target')
+    # Plot individual catalogs
+    if 'raStack_3pi' in data_catalog.colnames:
+        delta_ra_3pi, delta_dec_3pi = calc_separations(data_catalog['raStack_3pi'], data_catalog['decStack_3pi'], closest_ra, closest_dec, separate=True)
+        plt.scatter(delta_ra_3pi, delta_dec_3pi, marker='o', color='g', alpha=0.5, label='3PI')
+    if 'ra_sdss' in data_catalog.colnames:
+        delta_ra_sdss, delta_dec_sdss = calc_separations(data_catalog['ra_sdss'], data_catalog['dec_sdss'], closest_ra, closest_dec, separate=True)
+        plt.scatter(delta_ra_sdss, delta_dec_sdss, marker='o', color='r', alpha=0.5, label='SDSS')
+
+    # Set limits
+    plt.legend(loc='best')
+    plt.xlim(-1, +1)
+    plt.ylim(-1, +1)
     plt.gca().invert_xaxis()
     plt.xlabel('RA [arcsec]')
     plt.ylabel('DEC [arcsec]')
 
-def make_plot(object_name, ra_deg, dec_deg, output_table, data_catalog, info_table, best_host, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_nature, first_mjd, bright_mjd, search_radius, star_cut, Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan, do_observability, red_amplitude = np.nan, red_amplitude2 = np.nan, red_offset = np.nan, red_magnitude = np.nan, green_amplitude = np.nan, green_amplitude2 = np.nan, green_offset = np.nan, green_magnitude = np.nan, chi2 = np.nan, g_correct = 0, r_correct = 0):
-    '''
-    Create a diagnosis plot with the light curve and field image of a transient
+
+def plot_legend(sub_y, sub_x, sub_n, used_filters, used_sources):
+    """
+    Include a legend with the light curve information
+    in the plot.
 
     Parameters
-    ---------------
-    object_name           : Name of the transient
-    ra_deg, dec_deg       : Coordiantes of the transient in degrees
-    output_table          : Data with photometry
-    data_catalog          : Astropy table with catalog data 
-    info_table            : Table with all the output FLEET information
-    best_host             : Index of best host
-    host_radius           : The half-light radius of the best host in arcsec
-    host_separation       : The transient-host separation in arcsec
-    host_ra, host_dec     : Host coordinates
-    host_Pcc              : The probability of chance coincidence for the best host
-    host_magnitude        : The magnitude of the best host
-    host_nature           : Probability of object being a galaxy
-    first_mjd             : First MJD in either g or r from fit_linex()
-    bright_mjd            : Brightest MJD in either g or r from fit_linex()
-    search_radius         : For plot limit purposes
-    star_cut              : maximum allowed probability of an object to be a star
-    Dates_MMT             : Datetime format of hours
-    Airmass_MMT           : Airmass of target at MMT
-    SunElevation_MMT      : Sun's elevation at MMT 
-    Dates_Magellan        : Datetime format of hours
-    Airmass_Magellan      : Airmass of target at Magellan
-    SunElevation_Magellan : Sun's elevation at Magellan 
-    red_amplitude         : Parameters from fit_linex()
-    red_amplitude2        : 
-    red_offset            : 
-    red_magnitude         : 
-    green_amplitude       : 
-    green_amplitude2      : 
-    green_offset          : 
-    green_magnitude       : 
-    chi2                  : 
-    g_correct             : extinction value in g band
-    r_correct             : extinction value in r band
+    ----------
+    sub_y : int
+        Number of rows in the subplot
+    sub_x : int
+        Number of columns in the subplot
+    sub_n : int
+        Subplot number
+    used_filters : list
+        List of filters used in the plot
+    used_sources : list
+        List of sources used in the plot
+    """
 
-    Output
-    ---------------
-    Saves an output to plots/ directory
-    '''
+    # Select Plot Colors
+    all_colors = plot_colors(used_filters)
 
-    # Correct for extinction
-    output_table_correct = extinct(output_table, g_correct, r_correct)
+    # Select groups of Data (detections and upper limits)
+    is_det_ztf = np.flatnonzero(np.isin(used_sources, ['ZTF', 'Alerce']))
+    is_det_local = np.flatnonzero(np.isin(used_sources, ['Local', 'FLWO']))
+    is_det_other = np.where(~np.isin(used_sources, ['ZTF', 'Local', 'FLWO']))[0]
+
+    plt.subplot(sub_y, sub_x, sub_n)
+    if len(is_det_ztf) > 0:
+        plt.scatter([], [], marker='d', alpha=1.0, s=90, color='k', label='ZTF')
+    if len(is_det_local) > 0:
+        plt.scatter([], [], marker='*', alpha=1.0, s=90, color='k', label='Local')
+    if len(is_det_other) > 0:
+        plt.scatter([], [], marker='o', alpha=1.0, s=90, color='k', label='OSC')
+
+    for i in range(len(used_filters)):
+        plt.scatter([], [], marker='o', alpha=1.0, s=90, color=all_colors[i], label=used_filters[i])
+
+    plt.legend(loc='center', frameon=False)
+    plt.tick_params(axis='both', left=False, top=False, right=False, bottom=False,
+                    labelleft=False, labeltop=False, labelright=False, labelbottom=False)
+    plt.axis('off')
+
+
+def make_plot(input_table, output_table, data_catalog, info_table, telescope_arrays, dates_arrays,
+              airmasses_arrays, sun_elevations_arrays, plot_dir='plots', do_observability=True,
+              include_het=False, pupil_fraction=0.3):
+    """
+    Create a diagnosis plot with the light curve, field image, and all other information about
+    a transient.
+
+    Parameters
+    ----------
+    input_table : astropy.table.Table
+        Data with photometry
+    output_table : astropy.table.Table
+        Data with information about the transient
+    data_catalog : astropy.table.Table
+        Astropy table with catalog data
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    telescope_arrays : list
+        List of names for all telescopes for which
+        to plot the airmass curves
+    dates_arrays : list
+        List of date arrays for each telescope
+    airmasses_arrays : list
+        List of airmass arrays for each telescope
+    sun_elevations_arrays : list
+        List of sun elevation arrays for each telescope
+    plot_dir : str
+        Directory to save the plots
+    do_observability : bool
+        Whether to plot observability information
+    include_het : bool
+        Whether to include visibility from HET
+    pupil_fraction : float
+        Fraction of the pupil to use for HET observability
+    """
+
+    # Get object name
+    object_name = info_table['object_name'][0]
+
+    # Set up plot
+    plt.close('all')
+    plt.figure(figsize=(24, 18))
+    plt.subplots_adjust(hspace=0.25)
+
+    # Plot magnitude as a function of distance, coded by galaxyness
+    plot_nature_mag_distance(3, 4, 1, data_catalog, info_table)
+    # Plot magnitude as a function of distance, coded by probability of being the host
+    plot_host_mag_distance(3, 4, 2, data_catalog, info_table)
+    # Plot host information
+    plot_host_information(3, 4, 3, info_table)
+    # Plot observability
+    if do_observability:
+        plot_observability(3, 4, 4, info_table, telescope_arrays, dates_arrays, airmasses_arrays, sun_elevations_arrays, include_het,
+                           pupil_fraction=pupil_fraction)
+    # Plot RA and DEC coded by size
+    plot_ra_dec_size(3, 4, 5, data_catalog, info_table)
+    # Plot RA ande DEC coded by magnitude
+    plot_ra_dec_magnitude(3, 4, 6, data_catalog, info_table)
+    # Plot image of the field
+    plot_field_image(3, 4, 7, info_table)
+    # Plot zoomed in light curve
+    used_filters, used_sources = plot_lightcurve(3, 4, 8, output_table, info_table, full_range=False)
+    # Plot host galaxy SED
+    plot_host_sed(3, 4, 9, data_catalog, info_table)
+    # Plot closest zoom in to the transient
+    plot_coordinates(3, 4, 10, data_catalog, info_table)
+    # Plot the legend with light curve information
+    plot_legend(3, 4, 11, used_filters, used_sources)
+    # Plot zoomed out light curve
+    plot_lightcurve(3, 4, 12, input_table, info_table, full_range=True)
+
+    plt.savefig(f'{plot_dir}/{object_name}_output.pdf', bbox_inches='tight')
+    plt.clf()
+    plt.close('all')
+
+
+def quick_plot(input_table, info_table, plot_dir='plots'):
+    """
+    Create a quick diagnosis plot with just the light curve of a transient.
+
+    Parameters
+    ----------
+    input_table : astropy.table.Table
+        Data with photometry
+    info_table : astropy.table.Table
+        Table with all the output FLEET information
+    plot_dir : str
+        Directory to save the plots
+    """
 
     # Create folder to store images, if it doesn't exist
-    if len(glob.glob('plots')) == 0:
-        os.system("mkdir plots")
+    os.makedirs(plot_dir, exist_ok=True)
 
-    # Properties of All Objects
-    separation         = flot(data_catalog['separation'         ])
-    hosts_magnitudes   = flot(data_catalog['effective_magnitude'])
-    output_nature      = flot(data_catalog['object_nature'      ])
-    chance_coincidence = flot(data_catalog['chance_coincidence' ])
-    objects_ra         = flot(data_catalog['ra_matched'         ])
-    objects_dec        = flot(data_catalog['dec_matched'        ])
-    halflight_radius   = flot(data_catalog['halflight_radius'   ])
+    # Get object information
+    object_name = info_table['object_name'][0]
+    object_class = info_table['object_class'][0]
 
-    # Properties of closest object
-    closest = np.nanargmin(separation)
-    closest_separation  = separation[closest]
-    closest_magnitude   = hosts_magnitudes[closest]
-    closest_nature      = output_nature[closest]
-    closest_coincidence = chance_coincidence[closest]
+    # Set up plot
+    plt.figure(figsize=(8, 7))
+    plt.subplots_adjust(hspace=0.2)
 
-    # Peak Transient magnitude
-    transient_magnitude = np.nanmin(output_table_correct['Mag'][(output_table['UL'] == 'False') & (output_table['Ignore'] == 'False')])
+    # Plot Lightcurve
+    plot_lightcurve(2, 1, 1, input_table, info_table, full_range=False)
+    plt.title(f'{object_name} - {object_class}')
+    plt.xlim(xmax=100)
 
-    # Zoom in if possible
-    if (host_separation < search_radius * 30):
-        search_radius_close = search_radius / 2
-    else:
-        search_radius_close = search_radius
+    # Plot full range light curve
+    plot_lightcurve(2, 1, 2, input_table, info_table, full_range=True)
+    plt.savefig(f'{plot_dir}/{object_name}_quick.pdf', bbox_inches='tight')
+    plt.clf()
+    plt.close('all')
+
+
+def calculate_purity_completeness(val_table, class_column='true_class_name', target_class='SLSN-I',
+                                  threshold_steps=100):
+    """
+    Calculate both the purity and completeness as a function of probability threshold for
+    a given validation table and object class.
+
+    Parameters
+    ----------
+    val_table : astropy.table.Table
+        The input table with probability and class columns
+    class_column : str
+        Column name for the class labels
+    target_class : str
+        The class name we're calculating metrics for
+    threshold_steps : int
+        Number of threshold steps to evaluate
+
+    Returns
+    -------
+    thresholds : numpy.ndarray
+        Array of threshold values
+    purities : numpy.ndarray
+        Corresponding purity values for each threshold
+    completeness : numpy.ndarray
+        Corresponding completeness values for each threshold
+    """
+
+    # Get the probabilities and true classes
+    probs = val_table[target_class]
+    true_classes = val_table[class_column]
+
+    # Count total number of target class instances
+    total_target_class = np.sum(true_classes == target_class)
+
+    # Create array of threshold values
+    thresholds = np.linspace(0, 1, threshold_steps)
+    purities = np.zeros(threshold_steps)
+    completeness = np.zeros(threshold_steps)
+
+    # Calculate metrics for each threshold
+    for i, threshold in enumerate(thresholds):
+        # Find samples above threshold
+        above_threshold = probs > threshold
+
+        # Count samples above threshold
+        n_samples_above = np.sum(above_threshold)
+
+        # Count true positives (correct predictions above threshold)
+        true_positives = np.sum((probs > threshold) & (true_classes == target_class))
+
+        # Calculate purity (precision)
+        purities[i] = true_positives / n_samples_above if n_samples_above > 0 else 0
+
+        # Calculate completeness (recall)
+        completeness[i] = true_positives / total_target_class if total_target_class > 0 else 0
+
+    return thresholds, purities, completeness
+
+
+def plot_metric_curves(training_days, testing_days, grouping, n_estimators, max_depth, features, model, clean,
+                       chunk_size, metric='both', output_dir='validations', class_column='true_class_name',
+                       target_class='SLSN-I', threshold_steps=100, file_pattern=None):
+    """
+    Plot the mean purity or completeness curve with 1-sigma confidence interval.
+
+    Parameters
+    ----------
+    training_days : float
+        The number of days of photometry to use for training.
+    testing_days : float
+        The number of days of photometry to use for testing.
+    grouping : str
+        The grouping of transient types to use for training.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    features : int
+        The index of the feature list to use for training.
+    model : str, either 'single' or 'double'
+        The model to use for training.
+    clean : bool
+        Whether to require objects to have a host galaxy.
+    chunk_size : int
+        Number of items to remove at a time during leave-out. Default is 1.
+    metric : str
+        Which metric to plot ('purity', 'completeness', or 'both')
+    output_dir : str
+        Directory containing validation tables and for output plots
+    class_column : str
+        Column name for the class labels
+    target_class : str
+        The class name we're calculating metrics for
+    threshold_steps : int
+        Number of threshold steps to evaluate
+    file_pattern : str
+        Optional pattern to filter files in the output directory
+    """
+
+    # Find all validation tables
+    if file_pattern is None:
+        file_pattern = (
+            f'{output_dir}/{training_days}_{testing_days}_{grouping}_*_{n_estimators}_'
+            f'{max_depth}_*_*_{features}_{model}_{clean}_{chunk_size}.txt'
+        )
+    table_files = glob.glob(file_pattern)
+
+    # Read all tables
+    tables = []
+    for file_path in table_files:
+        val_table = table.Table.read(file_path, format='ascii')
+        tables.append(val_table)
+        print(f"Loaded {file_path}, shape: {len(val_table)}")
+
+    # Format title
+    title = (
+        f"Train={training_days} Test={testing_days} Group={grouping} Estimators={n_estimators} Depth={max_depth}\n"
+        f"Features={features} Model={model} Clean={clean} Chunk={chunk_size}"
+    )
+
+    # Use a common set of threshold values for all tables
+    common_thresholds = np.linspace(0, 1, threshold_steps)
+    all_purities = []
+    all_completeness = []
+
+    # Calculate metrics for each table
+    for val_table in tables:
+        thresholds, purities, completeness = calculate_purity_completeness(
+            val_table,
+            class_column=class_column,
+            target_class=target_class,
+            threshold_steps=threshold_steps
+        )
+        all_purities.append(purities)
+        all_completeness.append(completeness)
+
+    # Convert to numpy arrays for calculations
+    all_purities = np.array(all_purities)
+    all_completeness = np.array(all_completeness)
+
+    # Calculate mean and standard deviation
+    mean_purity = np.mean(all_purities, axis=0)
+    std_purity = np.std(all_purities, axis=0)
+    mean_completeness = np.mean(all_completeness, axis=0)
+    std_completeness = np.std(all_completeness, axis=0)
+
+    # Plot based on specified metric
+    if metric.lower() in ['purity']:
+        # Plot mean purity line
+        plt.figure(figsize=(8, 6))
+        plt.plot(common_thresholds, mean_purity, 'g', label='Purity')
+
+        # Plot 1-sigma confidence interval
+        plt.fill_between(
+            common_thresholds,
+            np.maximum(0, mean_purity - std_purity),
+            np.minimum(1, mean_purity + std_purity),
+            color='g', alpha=0.2, linewidth=0
+        )
+
+        # Add labels and settings
+        plt.xlabel(f'P({target_class})')
+        plt.ylabel('Purity')
+        plt.ylim(0, 1.0)
+        plt.xlim(0, 1.0)
+        plt.title(title)
+
+        # Save purity plot
+        output_file = (
+            f'{output_dir}/purity_{target_class}_{training_days}_{testing_days}_{grouping}_'
+            f'{n_estimators}_{max_depth}_{features}_{model}_{clean}_{chunk_size}.pdf'
+        )
+        plt.savefig(output_file, bbox_inches='tight')
+        plt.clf()
+
+    if metric.lower() in ['completeness']:
+
+        # Plot mean completeness line
+        plt.figure(figsize=(8, 6))
+        plt.plot(common_thresholds, mean_completeness, 'b', label='Completeness')
+
+        # Plot 1-sigma confidence interval
+        plt.fill_between(
+            common_thresholds,
+            np.maximum(0, mean_completeness - std_completeness),
+            np.minimum(1, mean_completeness + std_completeness),
+            color='b', alpha=0.2, linewidth=0
+        )
+
+        # Add labels and settings
+        plt.xlabel(f'P({target_class})')
+        plt.ylabel('Completeness')
+        plt.ylim(0, 1.0)
+        plt.xlim(0, 1.0)
+        plt.title(title)
+
+        # Save completeness plot
+        output_file = (f'{output_dir}/completeness_{target_class}_{training_days}_{testing_days}_{grouping}_{n_estimators}_'
+                       f'{max_depth}_{features}_{model}_{clean}_{chunk_size}.pdf')
+
+        plt.savefig(output_file, bbox_inches='tight')
+        plt.clf()
+
+    # If both metrics are requested, create a combined plot
+    if metric.lower() == 'both':
+
+        # Plot both metrics
+        plt.figure(figsize=(8, 6))
+        plt.plot(common_thresholds, mean_purity, 'g', label='Purity')
+        plt.plot(common_thresholds, mean_completeness, 'b', label='Completeness')
+
+        # Plot 1-sigma confidence intervals
+        plt.fill_between(
+            common_thresholds,
+            np.maximum(0, mean_purity - std_purity),
+            np.minimum(1, mean_purity + std_purity),
+            color='g', alpha=0.1, linewidth=0
+        )
+        plt.fill_between(
+            common_thresholds,
+            np.maximum(0, mean_completeness - std_completeness),
+            np.minimum(1, mean_completeness + std_completeness),
+            color='b', alpha=0.1, linewidth=0
+        )
+
+        # Add labels and settings
+        plt.xlabel(f'P({target_class})')
+        plt.ylabel('Purity / Completeness')
+        plt.ylim(0, 1.0)
+        plt.xlim(0, 1.0)
+        plt.title(title)
+        plt.legend(loc='lower center')
+
+        # Save combined plot
+        output_file = (
+            f'{output_dir}/combined_{target_class}_{training_days}_{testing_days}_{grouping}_'
+            f'{n_estimators}_{max_depth}_{features}_{model}_{clean}_{chunk_size}.pdf'
+        )
+        plt.savefig(output_file, bbox_inches='tight')
 
     plt.close('all')
-    fig = plt.figure(figsize = (22,16))
-
-    plot_nature_mag_distance(3, 4,  1, separation, hosts_magnitudes, output_nature, transient_magnitude, host_separation, host_magnitude, host_nature, closest_separation, closest_magnitude, closest_nature, search_radius_close)
-    plot_host_mag_distance  (3, 4,  2, separation, hosts_magnitudes, output_nature, chance_coincidence, transient_magnitude, host_separation, host_magnitude, host_Pcc, closest_separation, closest_magnitude, closest_coincidence, search_radius_close, star_cut)
-    plot_host_information   (3, 4,  3, ra_deg, dec_deg, info_table, host_radius, host_separation, host_magnitude, transient_magnitude)
-    if do_observability:
-        plot_observability  (3, 4,  4, ra_deg, dec_deg, Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan)
-    plot_ra_dec_size        (3, 4,  5, objects_ra, objects_dec, ra_deg, dec_deg, output_nature, host_ra, host_dec, search_radius, halflight_radius, transient_magnitude)
-    plot_ra_dec_magnitude   (3, 4,  6, objects_ra, objects_dec, ra_deg, dec_deg, hosts_magnitudes, host_ra, host_dec, search_radius, transient_magnitude)
-    plot_field_image        (3, 4,  7, ra_deg, dec_deg, object_name, search_radius = search_radius)
-    used_colors, used_sources = plot_lightcurve(3,4,8, output_table_correct, first_mjd, bright_mjd, red_amplitude, red_amplitude2, red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, chi2, full_range = False)
-    plot_blackbody          (3, 4,  9, data_catalog, best_host)
-    plot_coordinates        (3, 4, 10, ra_deg,dec_deg, data_catalog, closest)
-    plot_legend             (3, 4, 11, used_colors, used_sources)
-    plot_lightcurve         (3, 4, 12, output_table_correct, first_mjd, bright_mjd, full_range = True)
-
-    plt.savefig('plots/%s_output.pdf'%object_name, bbox_inches = 'tight')
-    plt.clf(); plt.close('all')
 
 
-#data_catalog = catalog_operations('2018fd', table.Table.read('catalogs/2018fd.cat', format = 'ascii'), 137.651484362, 35.7217682668)
+def plot_confusion_matrix(training_days, testing_days, classes_names, grouping, n_estimators, max_depth, features, model,
+                          clean, chunk_size, output_dir='validations', norm=True, prob_threshold=0.5, figsize=(10, 8),
+                          file_pattern=None):
+    """
+    Plot a confusion matrix showing the mean values and standard deviations across multiple validation tables.
+
+    Parameters
+    ----------
+    training_days : float
+        The number of days of photometry used for training.
+    testing_days : float
+        The number of days of photometry used for testing.
+    grouping : str
+        The grouping of transient types used for training.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    features : int
+        The index of the feature list used for training.
+    model : str, either 'single' or 'double'
+        The model used for training.
+    clean : bool
+        Whether objects were required to have a host galaxy.
+    chunk_size : int
+        Number of items removed at a time during leave-out.
+    output_dir : str
+        Directory containing validation tables and for output plots
+    norm : bool, default=True
+        Whether to normalize the confusion matrix by row (true classes)
+    prob_threshold : float, default=0.5
+        Probability threshold for class assignment
+    figsize : tuple, default=(10, 8)
+        Figure size for the confusion matrix plot
+    file_pattern : str, optional
+        Optional pattern to filter files in the output directory
+    """
+
+    # Find all validation tables
+    if file_pattern is None:
+        file_pattern = (
+            f'{output_dir}/{training_days}_{testing_days}_{grouping}_*_{n_estimators}_'
+            f'{max_depth}_*_*_{features}_{model}_{clean}_{chunk_size}.txt'
+        )
+    table_files = glob.glob(file_pattern)
+
+    # Read all tables
+    tables = []
+    for file_path in table_files:
+        val_table = table.Table.read(file_path, format='ascii')
+        tables.append(val_table)
+        print(f"Loaded {file_path}, shape: {len(val_table)}")
+
+    class_indices = list(classes_names.values())
+    labels = list(classes_names.keys())
+    n_classes = len(class_indices)
+
+    # Initialize matrices for all tables
+    confusion_matrices = []
+    raw_counts_matrices = []
+
+    # Calculate confusion matrix for each table
+    for val_table in tables:
+        # Initialize confusion matrix for this table
+        cm = np.zeros((n_classes, n_classes))
+
+        # Calculate confusion matrix
+        for true_class_idx in class_indices:
+            true_class_mask = val_table['true_class'] == true_class_idx
+            true_class_samples = val_table[true_class_mask]
+            true_class_samples_values = true_class_samples[labels]
+
+            if len(true_class_samples) == 0:
+                continue
+
+            for pred_class_idx in class_indices:
+                pred_count = 0
+                for row in true_class_samples_values:
+                    probs = np.array(row.as_void().tolist())
+                    max_prob_idx = np.argmax(probs)
+                    if probs[max_prob_idx] > prob_threshold and classes_names[labels[max_prob_idx]] == pred_class_idx:
+                        pred_count += 1
+
+                cm[class_indices.index(true_class_idx)][class_indices.index(pred_class_idx)] = pred_count
+
+        raw_counts_matrices.append(cm.copy())
+
+        # Normalize if requested
+        if norm:
+            cm_type = 'Completeness'
+            row_sums = cm.sum(axis=1)
+            with np.errstate(divide='ignore', invalid='ignore'):  # Handle division by zero
+                cm_norm = cm / row_sums[:, np.newaxis]
+            cm_norm[np.isnan(cm_norm)] = 0
+            confusion_matrices.append(cm_norm)
+        else:
+            cm_type = 'Purity'
+            row_sums = cm.sum(axis=0)
+            with np.errstate(divide='ignore', invalid='ignore'):  # Handle division by zero
+                cm_norm = cm / row_sums[np.newaxis, :]
+            cm_norm[np.isnan(cm_norm)] = 0
+            confusion_matrices.append(cm_norm)
+
+    # Convert list of matrices to 3D array
+    confusion_matrices = np.array(confusion_matrices)
+    raw_counts_matrices = np.array(raw_counts_matrices)
+
+    # Calculate mean and standard deviation across all matrices
+    mean_cm = np.mean(confusion_matrices, axis=0)
+    std_cm = np.std(confusion_matrices, axis=0)
+    mean_raw_counts = np.mean(raw_counts_matrices, axis=0)
+
+    # Create the plot
+    plt.figure(figsize=figsize)
+
+    # Plot the mean values with a color scale
+    plt.imshow(mean_cm, cmap='Blues', vmin=0, vmax=1 if norm else None)
+
+    # Set ticks and labels
+    plt.xticks(np.arange(n_classes), labels, rotation=45, ha='right')
+    plt.yticks(np.arange(n_classes), labels)
+
+    # Add title
+    plt.title(f"{cm_type} Confusion Matrix (p > {prob_threshold})\nTrain={training_days} Test={testing_days} Group={grouping} "
+              f"Estimators={n_estimators} Depth={max_depth}\n"
+              f"Features={features} Model={model} Clean={clean} Chunk={chunk_size}")
+
+    plt.xlabel('Predicted Class')
+    plt.ylabel('True Class')
+
+    # Add text annotations for mean and std values
+    for i in range(n_classes):
+        for j in range(n_classes):
+            # Display as percentage with error
+            percentage = mean_cm[i, j] * 100
+            if confusion_matrices.shape[0] > 1:  # Only show std if we have multiple tables
+                std_percentage = std_cm[i, j] * 100
+                text = f"{percentage:.1f}\n±{std_percentage:.1f}%"
+            else:
+                text = f"{percentage:.1f}%"
+
+            # Add raw count in parentheses
+            text += f"\n({int(mean_raw_counts[i, j])})"
+
+            # Choose text color based on the cell's value (white for dark cells)
+            text_color = 'white' if mean_cm[i, j] > 0.5 else 'black'
+            plt.text(j, i, text, ha='center', va='center', color=text_color, fontsize=9)
+
+    # Tight layout to ensure all elements are visible
+    plt.tight_layout()
+
+    # Save the plot
+    output_file = (f'{output_dir}/{cm_type}_matrix_{training_days}_{testing_days}_{grouping}_'
+                   f'{n_estimators}_{max_depth}_{features}_{model}_{clean}_{chunk_size}_{norm}.pdf')
+    plt.savefig(output_file, bbox_inches='tight')
+    plt.clf()
+    plt.close('all')
+
+
+def plot_purity_grid(training_days_arr, testing_days_arr, grouping, n_estimators, max_depth, features, model, clean,
+                     chunk_size, metric='Purity', output_dir='validations', class_column='true_class_name',
+                     target_class='SLSN-I', threshold_steps=101, prob_threshold=0.5):
+    """
+    Compare the purity for a training set using different testing sets,
+    not necessarily the same one.
+
+    Parameters
+    ----------
+    training_days_arr : array
+        Array of the number of days of photometry to use for training.
+    testing_days_arr : array
+        Array of the number of days of photometry to use for testing.
+    grouping : str
+        The grouping of transient types to use for training.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    features : int
+        The index of the feature list to use for training.
+    model : str, either 'single' or 'double'
+        The model to use for training.
+    clean : bool
+        Whether to require objects to have a host galaxy.
+    chunk_size : int
+        Number of items to remove at a time during leave-out. Default is 1.
+    metric : str
+        Which metric to plot ('purity', 'completeness', or 'both')
+    output_dir : str
+        Directory containing validation tables and for output plots
+    class_column : str
+        Column name for the class labels
+    target_class : str
+        The class name we're calculating metrics for
+    threshold_steps : int
+        Number of threshold steps to evaluate
+    prob_threshold : float
+        Probability threshold
+    """
+
+    final_grid = np.zeros((len(training_days_arr), len(testing_days_arr))) * np.nan
+
+    for i in range(len(training_days_arr)):
+        for j in range(len(testing_days_arr)):
+            training_days = training_days_arr[i]
+            testing_days = testing_days_arr[j]
+            # Find all validation tables
+            file_pattern = (
+                f'{output_dir}/{training_days}_{testing_days}_{grouping}_*_{n_estimators}_'
+                f'{max_depth}_*_*_{features}_{model}_{clean}_{chunk_size}.txt'
+            )
+            table_files = glob.glob(file_pattern)
+
+            # Read all tables
+            tables = []
+            for file_path in table_files:
+                val_table = table.Table.read(file_path, format='ascii')
+                tables.append(val_table)
+                print(f"Loaded {file_path}, shape: {len(val_table)}")
+
+            # Use a common set of threshold values for all tables
+            all_purities = []
+            all_completeness = []
+
+            # Calculate metrics for each table
+            for val_table in tables:
+                thresholds, purities, completeness = calculate_purity_completeness(
+                    val_table,
+                    class_column=class_column,
+                    target_class=target_class,
+                    threshold_steps=threshold_steps
+                )
+                all_purities.append(purities)
+                all_completeness.append(completeness)
+
+            # Convert to numpy arrays for calculations
+            all_purities = np.array(all_purities)
+            all_completeness = np.array(all_completeness)
+
+            # Calculate mean and standard deviation
+            mean_purity = np.mean(all_purities, axis=0)
+            mean_completeness = np.mean(all_completeness, axis=0)
+
+            common_thresholds = np.linspace(0, 1, threshold_steps)
+            if metric.lower() == 'purity':
+                if np.iterable(mean_purity):
+                    final_grid[i, j] = mean_purity[common_thresholds == prob_threshold][0]
+            elif metric.lower() == 'completeness':
+                if np.iterable(mean_completeness):
+                    final_grid[i, j] = mean_purity[common_thresholds == prob_threshold][0]
+
+    # Create the plot
+    plt.figure(figsize=(8, 8))
+
+    # Plot the mean values with a color scale
+    plt.imshow(final_grid, cmap='Greens', vmin=0, vmax=1)
+
+    # # Set ticks and labels
+    plt.xticks(range(len(testing_days_arr)), testing_days_arr)
+    plt.yticks(range(len(training_days_arr)), training_days_arr)
+
+    # # Add title
+    plt.title(f"{metric} Comparison p({target_class}) > {prob_threshold}\nGroup={grouping} "
+              f"Estimators={n_estimators} Depth={max_depth}\n"
+              f"Features={features} Model={model} Clean={clean} Chunk={chunk_size}")
+
+    plt.xlabel('Testing Days')
+    plt.ylabel('Training Days')
+
+    # Add text annotations for mean and std values
+    for i in range(len(training_days_arr)):
+        for j in range(len(testing_days_arr)):
+            # Display as percentage with error
+            text = f"{final_grid[i, j] * 100:.1f}%"
+
+            # Choose text color based on the cell's value (white for dark cells)
+            text_color = 'white' if final_grid[i, j] > 0.5 else 'black'
+            plt.text(j, i, text, ha='center', va='center', color=text_color, fontsize=9)
+
+    # Tight layout to ensure all elements are visible
+    plt.tight_layout()
+
+    # Save the plot
+    output_file = (f'{output_dir}/{metric}_compare_{grouping}_'
+                   f'{n_estimators}_{max_depth}_{features}_{model}_{clean}_{chunk_size}_{target_class}.pdf')
+    plt.savefig(output_file, bbox_inches='tight')
+    plt.clf()
+    plt.close('all')

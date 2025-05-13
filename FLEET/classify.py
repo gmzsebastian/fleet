@@ -1,824 +1,1121 @@
-from FLEET.plot import make_plot, calculate_observability, redshift_magnitude, quick_plot
-from FLEET.catalog import get_catalog, catalog_operations, get_best_host, get_extinction, overwrite_glade
-from FLEET.transient import get_transient_info, generate_lightcurve, ignore_data
+from .transient import get_transient_info, process_lightcurve
+from .model import fit_data
+from .catalog import get_catalog, catalog_operations, overwrite_with_glade, get_best_host, host_limit
+from .plot import make_plot, calculate_observability, calc_absmag, quick_plot
+import pkg_resources
+import multiprocessing
+from functools import partial
 from sklearn.ensemble import RandomForestClassifier
 from imblearn.over_sampling import SMOTE
-from FLEET.lightcurve import fit_linex
 from astropy import table
-import pkg_resources
 import numpy as np
-import pickle
-import glob
 import os
+import glob
+import pickle
 
-fleet_data = os.environ['fleet_data']
+try:
+    fleet_data = os.environ['fleet_data']
+except KeyError:
+    fleet_data = os.path.join(os.path.dirname(__file__), 'data')
 
-def create_pickle(training_days, grouping, SMOTE_state, n_estimators, max_depth, clf_state, sorting_state, features, model, clean, prefix):
-    print('Creating Pickle', training_days, grouping, SMOTE_state, n_estimators, max_depth, clf_state, sorting_state, features, model, clean, prefix)
-
-    table_name0 = pkg_resources.resource_filename(__name__, 'training_set/center_table_%s_single.txt'%training_days)
-    table_name1 = pkg_resources.resource_filename(__name__, 'training_set/center_table_%s_double.txt'%training_days)
-    
-    # Import Data
-    if model == 0:
-        training_table_in = table.Table.read(table_name0, format = 'ascii')
-    elif model == 1:
-        training_table_in = table.Table.read(table_name1, format = 'ascii')
-
-    # Shuffle Order of Table
-    order = np.arange(len(training_table_in))
-    np.random.seed(sorting_state)
-    np.random.shuffle(order)
-
-    # Randomize Order of training set
-    training_table = training_table_in[order]
-
-    # Select Only Transients with host detections
-    if clean == 0:
-        clean_training = training_table[np.isfinite(training_table['red_amplitude']) & np.isfinite(training_table['host_Pcc'])]
-    if clean == 1:
-        clean_training = training_table[np.isfinite(training_table['red_amplitude']) & np.isfinite(training_table['host_Pcc']) & (training_table['input_separation'] > 0)]
-
-    # Select Features
-    if features == 1 : use_features = ['red_amplitude','green_amplitude','host_Pcc','host_nature','input_host_g_r','normal_separation','model_color','late_color20','chi2','delta_time','deltamag_red','deltamag_green'] # Every Feature
-
-    # For SLSNe - Late time
-    if features == 2 : use_features = ['red_amplitude','green_amplitude','host_Pcc'              ,'input_host_g_r','normal_separation','model_color','late_color20'                    ,'deltamag_red','deltamag_green'] # Optimal Features for SLSNe
-    if features == 3 : use_features = [                                  'host_Pcc'              ,'input_host_g_r','normal_separation'                                                 ,'deltamag_red','deltamag_green'] # Optimal Host-only Features for SLSNe
-    if features == 4 : use_features = ['red_amplitude','green_amplitude'                                                              ,'model_color','late_color20','chi2'                                             ] # Optimal Lightcurve-only Features for SLSNe
-
-    # For SLSNe - Rapid
-    if features == 5 : use_features = ['red_amplitude','green_amplitude','host_Pcc'              ,'input_host_g_r','normal_separation','model_color'                      ,'delta_time','deltamag_red','deltamag_green'] # Optimal Features for SLSNe - rapid
-    if features == 6 : use_features = [                                  'host_Pcc'              ,'input_host_g_r','normal_separation'                                    ,'delta_time','deltamag_red','deltamag_green'] # Optimal Host-only Features for SLSNe - rapid
-    if features == 7 : use_features = ['red_amplitude','green_amplitude'                                                              ,'model_color'               ,'chi2','delta_time'                                ] # Optimal Lightcurve-only Features for SLSNe - rapid
-
-    # Add Amplitude 2 to double models
-    if model == 1:
-        use_features += ['red_amplitude2','green_amplitude2']
-
-    # Create array with Training and Testing data
-    training_data = np.array(clean_training[use_features].to_pandas())
-
-    # Names and Classes
-    training_class_in = np.array(clean_training['object_class'])
-
-    if grouping == 11:
-        training_class_in[np.where(training_class_in == 'LBV'    )] = 'Star'
-        training_class_in[np.where(training_class_in == 'Varstar')] = 'Star'
-        training_class_in[np.where(training_class_in == 'CV'     )] = 'Star'
-        training_class_in[np.where(training_class_in == 'SNIbn'  )] = 'SNIbc'
-        training_class_in[np.where(training_class_in == 'SNIb'   )] = 'SNIbc'
-        training_class_in[np.where(training_class_in == 'SNIbc'  )] = 'SNIbc'
-        training_class_in[np.where(training_class_in == 'SNIc'   )] = 'SNIbc'
-        training_class_in[np.where(training_class_in == 'SNIc-BL')] = 'SNIbc'
-        training_class_in[np.where(training_class_in == 'SNII'   )] = 'SNII'
-        training_class_in[np.where(training_class_in == 'SNIIP'  )] = 'SNII'
-
-        classes_names = {'AGN'     : 0, 'SLSN-I' : 1, 'SLSN-II' : 2, 'SNII'    : 3, 'SNIIb'   : 4,
-                         'SNIIn'   : 5, 'SNIa'   : 6, 'SNIbc'   : 7, 'Star'    : 8, 'TDE'     : 9}
-
-    # Transform classes into numbers
-    training_class = np.array([classes_names[i] for i in training_class_in]).astype(int)
-
-    # SMOTE the data
-    sampler = SMOTE(random_state=SMOTE_state)
-    data_train_smote, class_train_smote = sampler.fit_resample(training_data, training_class)
-
-    # Train Random Forest Classifier
-    clf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=clf_state)
-    clf.fit(data_train_smote, class_train_smote)
-
-    pickle_name = f'{prefix}_{training_days}_{grouping}_{SMOTE_state}_{n_estimators}_{max_depth}_{clf_state}_{sorting_state}_{features}_{model}_{clean}.pkl'
-    filename = os.path.join(fleet_data, pickle_name)
-
-    with open(filename,'wb') as f:
-        pickle.dump(clf,f)
-
-def save_pickles():
-    '''
-    Dummy default function to save the necessary pickle files for FLEET
-    '''
-
-    # Shared Parameters
-    sorting_states = np.array([38,39,40,41,42])
-    clean          = 0
-    grouping       = 11
-    n_estimators   = 100
-
-    # Main late-time
-    training_days  = 75
-    max_depth      = 15
-    featuress      = [2]
-    model          = 1
-
-    for state in sorting_states:
-        for features in featuress:
-            create_pickle(training_days, grouping, state, n_estimators, max_depth, state, state, features, model, clean, 'main_late')
-
-    # SLSNe Rapid
-    training_days  = 15
-    max_depth      = 20
-    featuress      = [5]
-    model          = 0
-
-    for state in sorting_states:
-        for features in featuress:
-            create_pickle(training_days, grouping, state, n_estimators, max_depth, state, state, features, model, clean, 'slsn_rapid')
-
-    # TDE Rapid
-    training_days  = 20
-    grouping       = 11
-    SMOTE_states   = np.array([38,39,40,41,42])
-    n_estimators   = 100
-    max_depth      = 20
-    sorting_states = np.array([38,39,40,41,42]) # same as clf_state
-    featuress      = np.array([5]) # Main, host only, phot only
-    model          = 0
-    clean          = 0
-
-    for state in sorting_states:
-        for features in featuress:
-            create_pickle(training_days, grouping, state, n_estimators, max_depth, state, state, features, model, clean, 'tde_rapid')
+feature_set = {2: ['lc_width_r', 'lc_width_g', 'host_Pcc', 'input_host_g_r',
+                   'normal_separation', 'color_peak', 'late_color20',
+                   'deltamag_red', 'deltamag_green'],
+               5: ['lc_width_r', 'lc_width_g', 'host_Pcc', 'input_host_g_r',
+                   'normal_separation', 'color_peak', 'late_color20',
+                   'delta_time', 'deltamag_red', 'deltamag_green'],
+               17: ['lc_width', 'lc_decline', 'initial_temp', 'cooling_rate',
+                    'host_Pcc', 'input_host_g_r', 'normal_separation', 'color_peak',
+                    'late_color20', 'delta_time', 'deltamag_red', 'deltamag_green']
+               }
 
 
-def create_features(acceptance_radius,import_ZTF,import_OSC,import_local,import_lightcurve,reimport_catalog,search_radius,Pcc_filter,Pcc_filter_alternative,star_separation,star_cut,
-                    date_range,late_phase,n_walkers,n_steps,n_cores,model,training_days,sorting_state,clean,SMOTE_state,clf_state,n_estimators,max_depth,feature_set,neighbors,
-                    recalculate_nature,classifier,n_samples,plot_lightcurve,do_observability,save_features,ra_deg, dec_deg, transient_source, object_name, object_name_in,
-                    ztf_name, tns_name, object_class, g_correct, r_correct, dust_map, red_amplitude, red_amplitude2,
-                    red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, model_color, late_color, late_color10, late_color20, late_color40,
-                    late_color60, bright_mjd, first_mjd, green_brightest, red_brightest, chi2, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g,
-                    host_magnitude_r, host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection, use_redshift, redshift_label, hostless_cut = 0.1):
-    '''
-    Create an astropy table with all the relevant features to feed into the classifier
+def format_training(training_days, grouping, sorting_state, features, model, clean, remove_bad=True):
+    """
+    Function that will format the training set for needed for the classifier.
+    Can be used to either create a new pickle file, or to validate the classifier.
 
     Parameters
-    ---------------
-    acceptance_radius      : Threshold in arcseconds for catalog cross-matching
-    import_ZTF             : Import ZTF data?
-    import_OSC             : Import OSC data?
-    import_local           : Import local photometry data?
-    import_lightcurve      : Regenerate existing lightcurve file?
-    reimport_catalog       : Overwrite the existing 3PI/SDSS catalog?
-    search_radius          : Search radius in arcminutes for the 3PI/SDSS catalog
-    Pcc_filter             : Filter for the host magnitude, radius, and Pcc
-    Pcc_filter_alternative : Alternative filter for the host magnitude, radius, and Pcc
-    star_separation        : Maximum star-transient separation to determine association
-    star_cut               : Maximum allowed probability of an object to be a star
-    date_range             : Maximum number of light curve days from the first detection to fit
-    late_phase             : Phase at which to calculate the late color
-    n_walkers              : Number of walkers for MCMC
-    n_steps                : Number of steps for MCMC
-    n_cores                : Number of cores for MCMC
-    model                  : 'single' or 'double', the latter fits late-time data
-    training_days          : Which training set to use for classification, days
-    sorting_state          : Seed number for list sorter
-    clean                  : 0 keeps all objects, and 1 removes orphan transients
-    SMOTE_state            : Seed number for SMOTE
-    clf_state              : Seed number for classifier
-    n_estimators           : Number of trees for random forest
-    max_depth              : Depth of trees for random forest
-    feature_set            : Set of features to use
-    neighbors              : Neighbors to use for star/galaxy separator
-    recalculate_nature     : Overwrite existing Nature column?
-    classifier             : Classifier name used for classification
-    n_samples              : Number of random seeds to use
-    plot_lightcurve        : Save an output plot with the light curve and PS1 image?
-    do_observability       : Calculate Observavility from Magellan and MMT?
-    save_features          : Save the features table to a file?
-    ra_deg                 : Transient RA
-    dec_deg                : Transient DEC
-    g_correct              : Extinction in g-band in SFD map
-    r_correct              : Extinction in r-band in SFD map
-    red_amplitude          : Light curve width in r-band, extinction corrected
-    red_amplitude2         : Light curve Amplitude (W2 / A) in r-band, extinction corrected, default 0.37
-    red_offset             : Time offset in r-band
-    red_magnitude          : Peak r-band model magnitude, extinction corrected
-    green_amplitude        : Light curve width in g-band, extinction corrected
-    green_amplitude2       : Light curve Amplitude (W2 / A) in g-band, extinction corrected, default 0.55
-    green_offset           : Time offset in g-band
-    green_magnitude        : Peak g-band model magnitude, extinction corrected
-    model_color            : Model g-r measured at bright_mjd
-    late_color             : Model g-r measured at specified phase
-    late_color10           : Model g-r measured at bright_mjd + 10
-    late_color20           : Model g-r measured at bright_mjd + 20
-    late_color40           : Model g-r measured at bright_mjd + 40
-    late_color60           : Model g-r measured at bright_mjd + 60
-    bright_mjd             : MJD of brightest magnitude, except UL and Ignore, any band
-    first_mjd              : MJD of first detection, except UL and Ignore, any band
-    green_brightest        : Peak measured g-band magnitude, extinction corrected
-    red_brightest          : Peak measured r-band magnitude, extinction corrected
-    chi2                   : Combined reduced chi^2 of r and g band light curve models
-    host_radius            : Half-light radius in i-band, or r-band if i is not detected
-    host_separation        : Host-transient separation, not band-dependent
-    host_ra                : Host RA
-    host_dec               : Host DEC
-    host_Pcc               : Probability of chance coincidence in i-band, or r-band if i is not detected, not extinction corrected
-    host_magnitude         : Host magnitude in i-band, or r-band if i is not detected, not extinction corrected
-    host_magnitude_g       : Host magnitude in g-band, not extinction corrected
-    host_magnitude_r       : Host magnitude in r-band, not extinction corrected
-    host_nature            : 0 means star, 1 means galaxy, averaged among all available bands
-    photoz                 : SDSS photometric redshift
-    photoz_err             : SDSS photometric redshift error
-    specz                  : SDSS spectroscopic redshift
-    specz_err              : SDSS spectroscopic redshift error
-    best_host              : Index of best host from catalog
-    redshift               : Redshift used or specified by used
-    delta_time             : bright_mjd - first_mjd
-    deltamag_red           : Host - Transient mag, using default "host_magnitude", extinction ignored. Or 3PI 5-sigma limits if undeteced.
-    deltamag_green         : Host - Transient mag, using default "host_magnitude", extinction ignored. Or 3PI 5-sigma limits if undeteced.
-    absmag                 : Absolute magnitude using "red_brightest" and "redshift"
-    input_separation       : Same as "host_separation", but 0 if "host_Pcc" > "hostless_cut"
-    input_size             : Same as "host_radius", but 0 if "host_Pcc" > "hostless_cut"
-    input_magnitude        : Same as "host_magnitude", but 0 if "host_Pcc" > "hostless_cut"
-    normal_separation      : "input_separation" / "input_size"
-    true_deltamag_red      : Host - Transient mag, using default "host_magnitude_r", extinction ignored. Or 3PI 5-sigma limits if undeteced.
-    true_deltamag_green    : Host - Transient mag, using default "host_magnitude_g", extinction ignored. Or 3PI 5-sigma limits if undeteced.
-    hostless_cut           : Only consider host galaxies with a with a probability of chance coincidence lower than this
-
-    Return
-    ---------------
-    An astropy table with all the relevant features
-
-    '''
-
-    # Calculate time from discovery to peak
-    delta_time = bright_mjd - first_mjd
-
-    # Obtain Features
-    if (host_Pcc <= 0.02) | ((host_Pcc <= 0.07) & (host_separation <= 8)) | force_detection:
-        input_separation  = host_separation
-        input_size        = host_radius
-        input_magnitude   = host_magnitude
-        normal_separation = input_separation / input_size
-
-        # Using the right host magnitude
-        true_deltamag_red   = host_magnitude_r - red_brightest
-        true_deltamag_green = host_magnitude_g - green_brightest
-        input_host_g_r      = host_magnitude_g - host_magnitude_r
-
-    else:
-        input_separation  = 0
-        input_size        = 0
-        normal_separation = 0
-        input_magnitude   = 23.1 # i-band limit from 3PI
-
-        # Using the right host magnitude
-        true_deltamag_red   = 23.2 - red_brightest    # r-band limit from 3PI
-        true_deltamag_green = 23.3 - green_brightest  # g-band limit from 3PI
-        input_host_g_r      = 0
-
-    # Calculate deltamag (Host - Transient)
-    deltamag_red   = input_magnitude - red_brightest
-    deltamag_green = input_magnitude - green_brightest
-
-    # Redshift and Absolute Magnitude
-    if np.isfinite(red_brightest):
-        absmag, _ = redshift_magnitude(red_brightest, np.max([use_redshift, 0]))
-        if np.isinf(absmag): absmag = 0
-    else:
-        absmag = np.nan
-
-    data = [acceptance_radius,import_ZTF,import_OSC,import_local,import_lightcurve,reimport_catalog,search_radius,Pcc_filter,Pcc_filter_alternative,star_separation,star_cut,
-            date_range,late_phase,n_walkers,n_steps,n_cores,model,training_days,sorting_state,clean,SMOTE_state,clf_state,n_estimators,max_depth,feature_set,neighbors,
-            recalculate_nature,classifier,n_samples,plot_lightcurve,do_observability,save_features,ra_deg, dec_deg, transient_source, object_name,
-            object_name_in, ztf_name, tns_name, object_class, g_correct, r_correct, dust_map, red_amplitude, red_amplitude2,
-            red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, model_color, late_color, late_color10, late_color20, late_color40,
-            late_color60, bright_mjd, first_mjd, green_brightest, red_brightest, chi2, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g,
-            host_magnitude_r, input_host_g_r, host_nature, photoz, photoz_err, specz, specz_err, best_host, use_redshift, redshift_label, delta_time, deltamag_red, deltamag_green, absmag,
-            input_separation, input_size, input_magnitude, normal_separation, true_deltamag_red, true_deltamag_green, hostless_cut]
-    names = ['acceptance_radius','import_ZTF','import_OSC','import_local','import_lightcurve','reimport_catalog','search_radius','Pcc_filter','Pcc_filter_alternative','star_separation','star_cut',
-             'date_range','late_phase','n_walkers','n_steps','n_cores','model','training_days','sorting_state','clean','SMOTE_state','clf_state','n_estimators','max_depth','feature_set','neighbors',
-             'recalculate_nature','classifier','n_samples','plot_lightcurve','do_observability','save_features','ra_deg', 'dec_deg', 'transient_source', 'object_name',
-             'object_name_in', 'ztf_name', 'tns_name', 'object_class', 'g_correct', 'r_correct', 'dust_map', 'red_amplitude', 'red_amplitude2',
-            'red_offset', 'red_magnitude', 'green_amplitude', 'green_amplitude2', 'green_offset', 'green_magnitude', 'model_color', 'late_color', 'late_color10', 'late_color20', 'late_color40',
-            'late_color60', 'bright_mjd', 'first_mjd', 'green_brightest', 'red_brightest', 'chi2', 'host_radius', 'host_separation', 'host_ra', 'host_dec', 'host_Pcc', 'host_magnitude', 'host_magnitude_g',
-            'host_magnitude_r', 'input_host_g_r', 'host_nature', 'photoz', 'photoz_err', 'specz', 'specz_err', 'best_host', 'redshift', 'redshift_label', 'delta_time', 'deltamag_red', 'deltamag_green', 'absmag',
-            'input_separation', 'input_size', 'input_magnitude', 'normal_separation', 'true_deltamag_red', 'true_deltamag_green', 'hostless_cut']
-    types = ['float64','S25','S25','S25','S25','S25','float64','S25','S25','float64','float64','float64','float64','float64','float64','float64','S25','float64','float64',
-            'float64','float64','float64','float64','float64','float64','float64','S25','S25','float64','S25','S25','S25','float64', 'float64', 'S25', 'S25', 'S25', 'S25', 'S25', 'S25', 'float64', 'float64', 'S25', 'float64', 'float64',
-            'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64',
-            'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64',
-            'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'S25', 'float64', 'float64', 'float64', 'float64',
-            'float64', 'float64', 'float64', 'float64', 'float64', 'float64', 'float64']
-
-    features_table = table.Table(data = np.array(data), names = names, dtype = types)
-
-    return features_table
-
-def create_training_testing(object_name, features_table, training_days = 20, model = 'single', clean = 0, feature_set = 13, sorting_state = 42, SMOTE_state = 42, clf_state = 42, n_estimators = 100, max_depth = 7, hostless_cut = 0.1):
-    '''
-    Import the training set and modify the features_table according to the model
-    parameters specified.
-
-    Parameters
-    -------------
-    object_name    : Name of the object to exclude from training set
-    features_table : Astropy table with all the features of the new transient
-    training_days  : What data set to use for training
-    model          : Which model to use for training, single or double
-    clean          : Clean hostless transients?
-    feature_set    : Which feature set to use
-    sorting_state  : Seed number for list sorter
-    SMOTE_state    : Seed number for SMOTE
-    clf_state      : Seed number for classifier
-    n_estimators   : Number of trees
-    max_depth      : Depth of trees
-    hostless_cut   : Only consider hosts with a Pcc lower than this
-
-    Return
-    ---------------
-    Predicted Probability to be ['AGN','SLSN-I','SLSN-II','SNII','SNIIb','SNIIn','SNIa','SNIbc','Star','TDE']
-    '''
-
-    # Import Data
-    table_name = pkg_resources.resource_filename(__name__, 'training_set/center_table_%s_%s.txt'%(training_days, model))
-    training_table_in = table.Table.read(table_name, format = 'ascii')
-
-    # Remove bad objects from training sample
-    bad  = ['2019vzf','2019wbg','2020acwp','2020eqv','2019fer','2020aafm','2020krl','2016hvm']
-    good = [i not in bad for i in training_table_in['object_name']]
-    training_table_in = training_table_in[good]
-
-    # Shuffle Order of Table
-    order = np.arange(len(training_table_in))
-    np.random.seed(sorting_state)
-    np.random.shuffle(order)
-    training_table = training_table_in[order]
-
-    # Select Only Clean Data
-    if clean == 0:
-        clean_training = training_table[np.isfinite(training_table['red_amplitude']) & np.isfinite(training_table['Pcc'])]
-    if clean == 1:
-        clean_training = training_table[np.isfinite(training_table['red_amplitude']) & np.isfinite(training_table['Pcc']) & (training_table['Pcc'] <= hostless_cut)]
-
-    # Select Features
-    if feature_set == 1 : use_features = ['red_amplitude','green_amplitude','host_Pcc','host_nature','input_host_g_r','normal_separation','model_color','late_color20','chi2','delta_time','deltamag_red','deltamag_green'] # Every Feature
-
-    # For SLSNe - Late time
-    if feature_set == 2 : use_features = ['red_amplitude','green_amplitude','host_Pcc'              ,'input_host_g_r','normal_separation','model_color','late_color20'                    ,'deltamag_red','deltamag_green'] # Optimal Features for SLSNe
-    if feature_set == 3 : use_features = [                                  'host_Pcc'              ,'input_host_g_r','normal_separation'                                                 ,'deltamag_red','deltamag_green'] # Optimal Host-only Features for SLSNe
-    if feature_set == 4 : use_features = ['red_amplitude','green_amplitude'                                                              ,'model_color','late_color20','chi2'                                             ] # Optimal Lightcurve-only Features for SLSNe
-
-    # For SLSNe - Rapid
-    if feature_set == 5 : use_features = ['red_amplitude','green_amplitude','host_Pcc'              ,'input_host_g_r','normal_separation','model_color'                      ,'delta_time','deltamag_red','deltamag_green'] # Optimal Features for SLSNe - rapid
-    if feature_set == 6 : use_features = [                                  'host_Pcc'              ,'input_host_g_r','normal_separation'                                    ,'delta_time','deltamag_red','deltamag_green'] # Optimal Host-only Features for SLSNe - rapid
-    if feature_set == 7 : use_features = ['red_amplitude','green_amplitude'                                                              ,'model_color'               ,'chi2','delta_time'                                ] # Optimal Lightcurve-only Features for SLSNe - rapid
-
-    # If using the 'double' model, add the W2 parameter
-    if model == 'double':
-        use_features += ['red_amplitude2','green_amplitude2']
-
-    # Create array with Training and Testing data
-    training_data = np.array(clean_training[use_features].to_pandas())
-    testing_data  = np.array(features_table[use_features].to_pandas())
-
-    # Get names of objects and classes
-    training_class_in = np.array(clean_training['class'])
-
-    # Group Transients into groups
-    training_class_in[np.where(training_class_in == 'LBV'    )] = 'Star'
-    training_class_in[np.where(training_class_in == 'Varstar')] = 'Star'
-    training_class_in[np.where(training_class_in == 'CV'     )] = 'Star'
-
-    training_class_in[np.where(training_class_in == 'SNIbn'  )] = 'SNIbc'
-    training_class_in[np.where(training_class_in == 'SNIb'   )] = 'SNIbc'
-    training_class_in[np.where(training_class_in == 'SNIbc'  )] = 'SNIbc'
-    training_class_in[np.where(training_class_in == 'SNIc'   )] = 'SNIbc'
-    training_class_in[np.where(training_class_in == 'SNIc-BL')] = 'SNIbc'
-
-    training_class_in[np.where(training_class_in == 'SNII'   )] = 'SNII'
-    training_class_in[np.where(training_class_in == 'SNIIP'  )] = 'SNII'
-
-    classes_names = {'AGN'     : 0, 'SLSN-I' : 1, 'SLSN-II' : 2, 'SNII'    : 3, 'SNIIb'   : 4,
-                     'SNIIn'   : 5, 'SNIa'   : 6, 'SNIbc'   : 7, 'Star'    : 8, 'TDE'     : 9}
-    training_class = np.array([classes_names[i] for i in training_class_in]).astype(int)
-
-    # SMOTE the data
-    sampler = SMOTE(random_state=SMOTE_state)
-    data_train_smote, class_train_smote = sampler.fit_resample(training_data, training_class)
-
-    # Train Random Forest Classifier
-    clf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=clf_state)
-    clf.fit(data_train_smote, class_train_smote)
-
-    # Predict Excluded Object
-    predicted_probability = 100 * clf.predict_proba(testing_data)
-
-    return predicted_probability
-
-def pickled_training_set(filename, features_table, feature_set, model):
-    # Select Features
-    if feature_set == 1 : use_features = ['red_amplitude','green_amplitude','host_Pcc','host_nature','input_host_g_r','normal_separation','model_color','late_color20','chi2','delta_time','deltamag_red','deltamag_green'] # Every Feature
-
-    # For SLSNe - Late time
-    if feature_set == 2 : use_features = ['red_amplitude','green_amplitude','host_Pcc'              ,'input_host_g_r','normal_separation','model_color','late_color20'                    ,'deltamag_red','deltamag_green'] # Optimal Features for SLSNe
-    if feature_set == 3 : use_features = [                                  'host_Pcc'              ,'input_host_g_r','normal_separation'                                                 ,'deltamag_red','deltamag_green'] # Optimal Host-only Features for SLSNe
-    if feature_set == 4 : use_features = ['red_amplitude','green_amplitude'                                                              ,'model_color','late_color20','chi2'                                             ] # Optimal Lightcurve-only Features for SLSNe
-
-    # For SLSNe - Rapid
-    if feature_set == 5 : use_features = ['red_amplitude','green_amplitude','host_Pcc'              ,'input_host_g_r','normal_separation','model_color'                      ,'delta_time','deltamag_red','deltamag_green'] # Optimal Features for SLSNe - rapid
-    if feature_set == 6 : use_features = [                                  'host_Pcc'              ,'input_host_g_r','normal_separation'                                    ,'delta_time','deltamag_red','deltamag_green'] # Optimal Host-only Features for SLSNe - rapid
-    if feature_set == 7 : use_features = ['red_amplitude','green_amplitude'                                                              ,'model_color'               ,'chi2','delta_time'                                ] # Optimal Lightcurve-only Features for SLSNe - rapid
-
-    # If using the 'double' model, add the W2 parameter
-    if model == 'double':
-        use_features += ['red_amplitude2','green_amplitude2']
-
-    # Create array with Training and Testing data
-    testing_data  = np.array(features_table[use_features].to_pandas())
-
-    with open(filename, 'rb') as f:
-        clf = pickle.load(f)
-
-    # Predict Excluded Object
-    predicted_probability = 100 * clf.predict_proba(testing_data)
-
-    return predicted_probability
-
-def predict_SLSN(object_name_in = '', ra_in = '', dec_in = '', redshift = np.nan, acceptance_radius = 3, import_ZTF = True, import_OSC = True, import_local = True, import_lightcurve = True, reimport_catalog = False,
-                 search_radius = 1.0, dust_map = 'SFD', Pcc_filter = 'i', Pcc_filter_alternative = 'r', star_separation = 1, star_cut = 0.1, date_range = 75, late_phase = 40, n_walkers = 50, n_steps = 1000,
-                 n_cores = 1, model = 'single', training_days = 20, hostless_cut = 0.1, sorting_state = 42, clean = 0, SMOTE_state = 42, clf_state = 42, n_estimators = 100, max_depth = 7, feature_set = 13,
-                 neighbors = 20, recalculate_nature = False, classifier = 'all', n_samples = 3, object_class = '', plot_lightcurve = False, do_observability = False, save_features = False, use_glade = False):
-    '''
-    Main Function to predict the probability of an object to be a Superluminous Supernovae
-    using the training set provided and a random forest algorithim. The function will query
-    the TNS, ZTF, and the OSC for data for the transient. And SDSS and 3PI for catalog data.
-
-    Parameters
-    -------------
-    object_name_in          : name of the transient (either ZTF, TNS, or other)
-    ra_in                   : R.A. in degrees or hms format
-    dec_in                  : Dec. in degrees or dms format
-    redshift                : redshift, only required for redshift classifier
-    acceptance_radius       : match objects for catalog cross-matching; in arcseconds
-    import_ZTF              : Import ZTF data (True) or read existing file (False)
-    import_OSC              : Import OSC data (True) or read existing file (False)
-    import_local            : Import local data from ./photometry directory
-    import_lightcurve       : Regenerate existing lightcurve file (True) or read
-                              the existing out from ./lightcurves (False)
-    reimport_catalog        : Overwrite the existing 3PI/SDSS catalog
-    search_radius           : Search radius in arcminutes for the 3PI/SDSS catalog
-    dust_map                : 'SF' or 'SFD', to query Schlafy and Finkbeiner 2011
-                              or Schlafy, Finkbeiner and Davis 1998.
-                              set to 'none' to not correct for extinction
-    Pcc_filter              : The effective magnitude, radius, and Pcc
-                              are calculated in this filter.
-    Pcc_filter_alternative  : If Pcc_filter is not found, use this one
-                              as an acceptable alternative.
-    star_separation         : A star needs to be this close to be matched
-                              to a transient [in Arcsec]
-    star_cut                : maximum allowed probability of an object to be a star
-    date_range              : Maximum number of light curve days from the first
-                              detection to use in fitting the light curve
-    late_phase              : Phase at which to calculate the late color
-    n_walkers               : Number of walkers for MCMC
-    n_steps                 : Number of steps for MCMC
-    n_cores                 : Number of cores for MCMC
-    model                   : 'single' or 'double' for the function to fit to the
-                              lightcurve. Use later one for full light curves.
-    training_days           : Which training set to use for classification
-    hostless_cut            : Only consider hosts with a Pcc lower than this
-    sorting_state           : Seed number for list sorter
-    clean                   : 0 keeps all objects, and 1 removed objects that do not
-                              have a detected host
-    SMOTE_state             : Seed number for SMOTE
-    clf_state               : Seed number for classifier
-    n_estimators            : Number of trees for random forest
-    max_depth               : Depth of trees for random forest
-    feature_set             : Set of features to use
-    neighbors               : neighbors to use for star/galaxy separator
-    recalculate_nature      : Overwrite existing Nature column?
-    classifier              : Pick the classifier to use based on the available information
-                              either 'quick', 'redshift', 'host', 'late', or 'all'. If empty
-                              default (or specified) values will be used.
-    n_samples               : Number of random seeds to use, only for the 'all' classifier
-    object_class            : Transient type, to overwrite any existing classes
-    plot_lightcurve         : Save an output plot with the light curve and PS1 image?
-    do_observability        : Calculate Observavility from Magellan and MMT?
-    save_features           : Save the features table to a file
-    use_glade               : Use the GLADE catalog to overwrite the best host
+    ----------
+    training_days : float
+        The number of days of photometry to use for training.
+    grouping : str
+        The grouping of transient types to use for training.
+    sorting_state : bool
+        The random seed for the sorting algorithm.
+    features : int
+        The index of the feature list to use for training.
+    model : str, either 'single' or 'double'
+        The model to use for training.
+    clean : bool
+        Whether to require objects to have a host galaxy.
+    remove_bad : bool
+        Whether to remove bad objects from the training set. Default is True.
 
     Returns
-    ---------------
-    Predicted Probability to be ['AGN','SLSN-I','SLSN-II','SNII','SNIIb','SNIIn','SNIa','SNIbc','Star','TDE']
+    -------
+    training_data : np.ndarray
+        The training data for the classifier.
+    training_class : np.ndarray
+        The training classes for the classifier.
+    training_names : np.ndarray
+        The AT names of each object in the table
+    classes_names : dict
+        The mapping of class names to indices.
+    """
 
-    '''
-    print('\n################# FLEET #################')
+    # Read in table with input parameters
+    table_name = pkg_resources.resource_filename(__name__, f'training_set/table_{model}_{training_days}.txt')
+    training_table_in = table.Table.read(table_name, format='ascii')
 
+    # Remove objects deemed to be bad
+    # Some either have the wrong host, really poor light curves, should be hostless when they are not, etc.
+    bad = ['2016hvm',  '2017fro',  '2018ebt',  '2018eub',  '2018ffj',  '2018hhr',
+           '2018hna',  '2018jsc',  '2019afa',  '2019baj',  '2019bjp',  '2019dnz',
+           '2019elm',  '2019gaf',  '2019gwl',  '2019gzd',  '2019hib',  '2019ief',
+           '2019lnz',  '2019pdx',  '2019pjs',  '2019qo',   '2019rom',  '2019spk',
+           '2019upq',  '2019wup',  '2019xdx',  '2020abyx', '2020acat', '2020aceu',
+           '2020ackf', '2020acwp', '2020adgg', '2020axk',  '2020bpi',  '2020cxe',
+           '2020dic',  '2020gar',  '2020gc',   '2020iji',  '2020kq',   '2020lmd',
+           '2020mjm',  '2020mos',  '2020mrf',  '2020nps',  '2020nze',  '2020rue',
+           '2020rxv',  '2020vba',  '2020xpy',  '2020ykb',  '2020ykr',  '2021cjy',
+           '2021csf',  '2021dpw]', '2021hbl',  '2021hiw',  '2021hmb',  '2021ojn',
+           '2021pie',  '2021sbc',  '2021scb',  '2021ued',  '2021uij',  '2021yte',
+           '2021zu']
+    if remove_bad:
+        training_table_in = training_table_in[~np.isin(training_table_in['object_name'], bad)]
 
+    # Shuffle the table rows
+    np.random.seed(sorting_state)
+    training_table = training_table_in[np.random.permutation(len(training_table_in))]
 
-    ########## Basic transient info ##########
-    ra_deg, dec_deg, transient_source, object_name, ztf_data, ztf_name, tns_name, object_class, osc_data = get_transient_info(object_name_in, ra_in, dec_in, object_class, acceptance_radius, import_ZTF, import_OSC, import_lightcurve)
-
-    # If transient info failed, return empty
-    if ra_deg == '--':
-        print('Coordinates cannot be empty')
-        return table.Table()
-    # If transient is too south, return empty
-    if dec_deg <= -32:
-        print(f'dec = {dec_deg}, too low for SDSS or 3PI')
-        return table.Table()
-    # Else, print correctly
-    print('%s %s %s'%(object_name, ra_deg, dec_deg))
-
-
-
-    ########## Lightcurve data ##########
-    output_table = generate_lightcurve(ztf_data, osc_data, object_name, ztf_name, tns_name, import_lightcurve, import_local)
-    # Ignore selected patches
-    output_table = ignore_data(object_name, output_table)
-
-    # If there's no data
-    if len(output_table) == 0:
-        print('No data in lightcurve')
-        return table.Table()
-    # If all data is ignored or non-detections
-    if np.sum((output_table['UL'] == 'False') & (output_table['Ignore'] == 'False')) == 0:
-        print('No useable data in lightcurve')
-        return table.Table()
-
-    # Get extinction values
-    g_correct, r_correct = get_extinction(ra_deg, dec_deg, dust_map)
-
-
-
-    ########## Fit Lightcurve ##########
-    red_amplitude, red_amplitude2, red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, model_color, late_color, late_color10, late_color20, late_color40, late_color60, bright_mjd, first_mjd, green_brightest, red_brightest, chi2 = fit_linex(output_table, date_range, n_walkers, n_steps, n_cores, model, g_correct, r_correct, late_phase)
-
-    # If fit failed there's probably not enough data
-    if np.isnan(red_amplitude):
-        if plot_lightcurve:
-            # MJD including UL and Ignores
-            #absolute_first_mjd = np.nanmin(np.array(output_table['MJD']).astype(float))
-            # = output_table['MJD'][np.nanargmin(output_table['Mag'])]
-            quick_plot(object_name, object_class, ra_deg, dec_deg, output_table, first_mjd, bright_mjd, full_range = True)
-        return table.Table()
-
-
-
-    ########## Catalog Operations ##########
-    data_catalog_out, catalog_exists = get_catalog(object_name, ra_deg, dec_deg, search_radius, dust_map, reimport_catalog)
-    # If there's no catalog, return empty
-    if len(data_catalog_out) == 0:
-        print('No data found in SDSS or 3PI')
-        return table.Table()
-
-    # Processing catalog data
-    print('Creating Catalog ...')
-    data_catalog = catalog_operations(object_name, data_catalog_out, ra_deg, dec_deg, Pcc_filter, Pcc_filter_alternative, neighbors, recalculate_nature, catalog_exists)
-
-    # Find the best host
-    if use_glade:
-        best_host_glade = overwrite_glade(ra_deg, dec_deg, object_name, data_catalog)
+    # Clean the table by removing objects without a host galaxy
+    if clean:
+        clean_training = training_table[np.isfinite(training_table['lc_width_r']) &
+                                        np.isfinite(training_table['host_Pcc']) & (training_table['input_separation'] > 0)]
     else:
-        best_host_glade = np.nan
+        if model == 'full':
+            clean_training = training_table[np.isfinite(training_table['lc_width']) & np.isfinite(training_table['host_Pcc'])]
+        elif (model == 'single') or (model == 'double'):
+            clean_training = training_table[np.isfinite(training_table['lc_width_r']) & np.isfinite(training_table['host_Pcc'])]
 
-    host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g, host_magnitude_r, host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection = get_best_host(data_catalog, star_separation, star_cut, best_host_glade)
+    # Select the feature set
+    in_features = feature_set[features]
 
-    # Define Appropriate Redshift
-    if np.isfinite(float(redshift)):
-        # User specified redshift
-        use_redshift   = float(redshift)
-        redshift_label = 'specz'
-    elif np.isfinite(float(specz)):
-        # Spectroscopic Redshift
-        use_redshift   = float(specz)
-        redshift_label = 'specz'
-    elif np.isfinite(float(photoz)):
-        # Photometric Redshift
-        use_redshift   = float(photoz)
-        redshift_label = 'photoz'
+    # Add the light curve decline for the double model
+    if model == 'double':
+        use_features = in_features + ['lc_decline_r', 'lc_decline_g']
     else:
-        # No Redshift
-        use_redshift   = np.nan
-        redshift_label = 'none'
+        use_features = in_features
 
-    ########## Generate Features ##########
-    features_table = create_features(acceptance_radius,import_ZTF,import_OSC,import_local,import_lightcurve,reimport_catalog,search_radius,Pcc_filter,Pcc_filter_alternative,star_separation,star_cut,
-                                     date_range,late_phase,n_walkers,n_steps,n_cores,model,training_days,sorting_state,clean,SMOTE_state,clf_state,n_estimators,max_depth,feature_set,neighbors,
-                                     recalculate_nature,classifier,n_samples,plot_lightcurve,do_observability,save_features,ra_deg, dec_deg, transient_source, object_name,
-                                     object_name_in, ztf_name, tns_name, object_class, g_correct, r_correct, dust_map, red_amplitude, red_amplitude2,
-                                     red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, model_color, late_color, late_color10, late_color20, late_color40,
-                                     late_color60, bright_mjd, first_mjd, green_brightest, red_brightest, chi2, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g,
-                                     host_magnitude_r, host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection, use_redshift, redshift_label, hostless_cut)
-    # Return table here if this is the end
-    if save_features:
-        if plot_lightcurve:
-            # MJD including UL and Ignores
-            #absolute_first_mjd = np.nanmin(np.array(output_table['MJD']).astype(float))
-            #bright_mjd = output_table['MJD'][np.nanargmin(output_table['Mag'])]
-            quick_plot(object_name, object_class, ra_deg, dec_deg, output_table, first_mjd, bright_mjd, g_correct, r_correct, red_amplitude, red_amplitude2, red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, full_range = False)
-        return features_table
+    # Create the training data
+    training_data = np.array(clean_training[use_features].to_pandas())
+    training_classes = np.array(clean_training['object_class'])
+    training_names = np.array(clean_training['object_name'])
 
-    print('Classifying ...')
-    if classifier == 'all':
-        # Late-time classifier
-        filenames_main = os.path.join(fleet_data, 'main_late_*.pkl')
-        full_filenames_main = glob.glob(filenames_main)
+    # Group transient types
+    if grouping == 11:
+        training_classes[np.where(training_classes == 'LBV')] = 'Star'
+        training_classes[np.where(training_classes == 'Varstar')] = 'Star'
+        training_classes[np.where(training_classes == 'CV')] = 'Star'
+        training_classes[np.where(training_classes == 'SNIbn')] = 'SNIbc'
+        training_classes[np.where(training_classes == 'SNIb')] = 'SNIbc'
+        training_classes[np.where(training_classes == 'SNIbc')] = 'SNIbc'
+        training_classes[np.where(training_classes == 'SNIc')] = 'SNIbc'
+        training_classes[np.where(training_classes == 'SNIc-BL')] = 'SNIbc'
+        training_classes[np.where(training_classes == 'SNII')] = 'SNII'
+        training_classes[np.where(training_classes == 'SNIIP')] = 'SNII'
 
-        for i in range(len(full_filenames_main)):
-            filename = full_filenames_main[i]
-            late_probability_n = pickled_training_set(filename, features_table, feature_set = 2, model = 'double')
-            if i == 0:
-                late_probability = late_probability_n
-            else:
-                late_probability = np.vstack([late_probability, late_probability_n])
-        late_probability_average = np.average(late_probability, axis = 0)
-        late_probability_std     = np.std    (late_probability, axis = 0)
-
-        # Rapid SLSN classifier
-        filenames_slsn = os.path.join(fleet_data, 'slsn_rapid_*.pkl')
-        full_filenames_slsn = glob.glob(filenames_slsn)
-
-        for i in range(len(full_filenames_slsn)):
-            filename = full_filenames_slsn[i]
-            quick_probability_n = pickled_training_set(filename, features_table, feature_set = 5, model = 'single')
-            if i == 0:
-                quick_probability = quick_probability_n
-            else:
-                quick_probability = np.vstack([quick_probability, quick_probability_n])
-        quick_probability_average = np.average(quick_probability, axis = 0)
-        quick_probability_std     = np.std    (quick_probability, axis = 0)
-
-        # Rapid TDE classifier
-        filenames_tde = os.path.join(fleet_data, 'tde_rapid_*.pkl')
-        full_filenames_tde = glob.glob(filenames_tde)
-
-        for i in range(len(full_filenames_tde)):
-            filename = full_filenames_tde[i]
-            host_probability_n = pickled_training_set(filename, features_table, feature_set = 5, model = 'single')
-            if i == 0:
-                host_probability = host_probability_n
-            else:
-                host_probability = np.vstack([host_probability, host_probability_n])
-        host_probability_average = np.average(host_probability, axis = 0)
-        host_probability_std     = np.std    (host_probability, axis = 0)
-
-        # Empty right now because I never use it
-        redshift_probability_average = np.zeros_like(quick_probability_average)
-        redshift_probability_std     = np.zeros_like(quick_probability_average)
+        classes_names = {'AGN': 0, 'SLSN-I': 1, 'SLSN-II': 2, 'SNII': 3, 'SNIIb': 4,
+                         'SNIIn': 5, 'SNIa': 6, 'SNIbc': 7, 'Star': 8, 'TDE': 9}
     else:
-        print("Other classifiers not implemented yet")
-        # quick_probability_n = create_training_testing(object_name, features_table, training_days = training_days_quick, model = model_quick, clean = clean_quick, feature_set = feature_set_quick, max_depth = max_depth_quick, clf_state = int(39 + i))
+        print(f'Grouping {grouping} not implemented')
+        return None, None, None
 
-    # Calculate Time Span
-    detections = (np.array(output_table['UL']) == b'False') & (np.array(output_table['Ignore']) == b'False') & ((output_table['Filter'] == 'r') | (output_table['Filter'] == 'g'))
-    time_span  = np.nanmax(output_table['MJD'][detections]) - np.nanmin(output_table['MJD'][detections])
-    # Calculate Observability
-    Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan, MMT_observable, Magellan_observable = calculate_observability(ra_deg, dec_deg, do_observability)
+    # Transform classes into numbers
+    training_class = np.array([classes_names[i] for i in training_classes]).astype(int)
 
-    # Output Array
-    info_data  = np.array([object_name, ztf_name, tns_name, object_class, ra_deg, dec_deg, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_nature, photoz, photoz_err, specz, specz_err, use_redshift, redshift_label, classifier, time_span, MMT_observable, Magellan_observable, *quick_probability_average, *quick_probability_std, *late_probability_average, *late_probability_std, *redshift_probability_average, *redshift_probability_std, *host_probability_average, *host_probability_std])
-    info_names = ['object_name'       ,'ztf_name'             ,'tns_name'             ,'object_class'         ,'ra_deg'               ,'dec_deg'              ,'host_radius'          ,'host_separation'      ,'host_ra'              ,'host_dec'          ,'host_Pcc'           ,'host_magnitude',
-                  'host_nature'       ,'photoz'               ,'photoz_err'           ,'specz'                ,'specz_err'            ,'use_redshift'         ,'redshift_label'       ,'classifier'           ,'time_span'            ,'MMT_observable'    ,'Magellan_observable',
-                  'P_quick_AGN'       ,'P_quick_SLSNI'        ,'P_quick_SLSNII'       ,'P_quick_SNII'         ,'P_quick_SNIIb'        ,'P_quick_SNIIn'        ,'P_quick_SNIa'         ,'P_quick_SNIbc'        ,'P_quick_Star'         ,'P_quick_TDE'       ,
-                  'P_quick_AGN_std'   ,'P_quick_SLSNI_std'    ,'P_quick_SLSNII_std'   ,'P_quick_SNII_std'     ,'P_quick_SNIIb_std'    ,'P_quick_SNIIn_std'    ,'P_quick_SNIa_std'     ,'P_quick_SNIbc_std'    ,'P_quick_Star_std'     ,'P_quick_TDE_std'   ,
-                  'P_late_AGN'        ,'P_late_SLSNI'         ,'P_late_SLSNII'        ,'P_late_SNII'          ,'P_late_SNIIb'         ,'P_late_SNIIn'         ,'P_late_SNIa'          ,'P_late_SNIbc'         ,'P_late_Star'          ,'P_late_TDE'        ,
-                  'P_late_AGN_std'    ,'P_late_SLSNI_std'     ,'P_late_SLSNII_std'    ,'P_late_SNII_std'      ,'P_late_SNIIb_std'     ,'P_late_SNIIn_std'     ,'P_late_SNIa_std'      ,'P_late_SNIbc_std'     ,'P_late_Star_std'      ,'P_late_TDE_std'    ,
-                  'P_redshift_AGN'    ,'P_redshift_SLSNI'     ,'P_redshift_SLSNII'    ,'P_redshift_SNII'      ,'P_redshift_SNIIb'     ,'P_redshift_SNIIn'     ,'P_redshift_SNIa'      ,'P_redshift_SNIbc'     ,'P_redshift_Star'      ,'P_redshift_TDE'    ,
-                  'P_redshift_AGN_std','P_redshift_SLSNI_std' ,'P_redshift_SLSNII_std','P_redshift_SNII_std'  ,'P_redshift_SNIIb_std' ,'P_redshift_SNIIn_std' ,'P_redshift_SNIa_std'  ,'P_redshift_SNIbc_std' ,'P_redshift_Star_std'  ,'P_redshift_TDE_std',
-                  'P_host_AGN'        ,'P_host_SLSNI'         ,'P_host_SLSNII'        ,'P_host_SNII'          ,'P_host_SNIIb'         ,'P_host_SNIIn'         ,'P_host_SNIa'          ,'P_host_SNIbc'         ,'P_host_Star'          ,'P_host_TDE'        ,
-                  'P_host_AGN_std'    ,'P_host_SLSNI_std'     ,'P_host_SLSNII_std'    ,'P_host_SNII_std'      ,'P_host_SNIIb_std'     ,'P_host_SNIIn_std'     ,'P_host_SNIa_std'      ,'P_host_SNIbc_std'     ,'P_host_Star_std'      ,'P_host_TDE_std'    ]
-    data_table = table.Table(info_data, names = info_names)
+    return training_data, training_class, training_names, classes_names
 
-    # Join Features and Information
-    use_names  = list(set(data_table.colnames) - set(features_table.colnames))
-    info_table = table.hstack([features_table, data_table[use_names]])
 
-    print('Plotting ...')
-    if plot_lightcurve:
-        make_plot(object_name, ra_deg, dec_deg, output_table, data_catalog, info_table, best_host, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_nature, first_mjd, bright_mjd, search_radius, star_cut, Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan, do_observability, red_amplitude, red_amplitude2, red_offset, red_magnitude, green_amplitude, green_amplitude2, green_offset, green_magnitude, chi2, g_correct, r_correct)
+def create_pickle(training_days, grouping, smote_state, n_estimators, max_depth, clf_state, sorting_state, features,
+                  model, clean, prefix, overwrite=False, remove_bad=True):
+    """
+    Create pickle file for the classifier based on the optimal parameters
+    of the random forest.
+
+    Parameters
+    ----------
+    training_days : float
+        The number of days of photometry to use for training.
+    grouping : str
+        The grouping of transient types to use for training.
+    smote_state : bool
+        The random seed for the SMOTE algorithm.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    clf_state : int
+        The random seed for the random forest classifier.
+    sorting_state : bool
+        The random seed for the sorting algorithm.
+    features : int
+        The index of the feature list to use for training.
+    model : str, either 'single' or 'double'
+        The model to use for training.
+    clean : bool
+        Whether to require objects to have a host galaxy.
+    prefix : str
+        The prefix for the pickle file name.
+    overwrite : bool
+        Whether to overwrite existing pickle files. Default is False.
+    remove_bad : bool
+        Whether to remove bad objects from the training set. Default is True.
+    """
+    # Create pickle file
+    pickle_name = f'{prefix}_{training_days}_{grouping}_{smote_state}_{n_estimators}_{max_depth}_{clf_state}_{sorting_state}_{features}_{model}_{clean}.pkl'
+    filename = os.path.join(fleet_data, pickle_name)
+
+    if os.path.exists(filename) and not overwrite:
+        print('Pickle file already exists:', filename)
+        return
+    else:
+        print('Creating Pickle for:', training_days, grouping, smote_state, n_estimators, max_depth, clf_state, sorting_state, features, model, clean, prefix)
+
+    # Format the training data
+    training_data, training_class, _, _ = format_training(training_days, grouping, sorting_state, features, model, clean=clean, remove_bad=remove_bad)
+
+    # SMOTE the data
+    sampler = SMOTE(random_state=smote_state)
+    data_train_smote, class_train_smote = sampler.fit_resample(training_data, training_class)
+
+    # Train Random Forest Classifier
+    print('Training Classifier...')
+    clf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=clf_state)
+    clf.fit(data_train_smote, class_train_smote)
+
+    # Save the pickle
+    with open(filename, 'wb') as f:
+        pickle.dump(clf, f)
+
+
+def leave_one_out(remove_ind, training_data, training_class, training_names, testing_data, testing_class, testing_names,
+                  smote_state, n_estimators, max_depth, clf_state):
+    """
+    This function will predict the class probabilities of objects in the training set,
+    by removing one or more objects at a time and training the classifier on the rest of the data.
+
+    Parameters
+    ----------
+    remove_ind : int or list/array
+        The index or indices of the objects to remove from the training set.
+    training_data : np.ndarray
+        The training data for the classifier.
+    training_class : np.ndarray
+        The training classes for the classifier.
+    training_names : np.ndarray
+        The AT names of each object in the table
+    testing_data : np.ndarray
+        The testing data for the classifier.
+    testing_class : np.ndarray
+        The testing classes for the classifier.
+    testing_names : np.ndarray
+        The AT names of each object in the table
+    smote_state : bool
+        The random seed for the SMOTE algorithm.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    clf_state : int
+        The random seed for the random forest classifier.
+
+    Returns
+    -------
+    predicted_probs : numpy.ndarray or list of numpy.ndarray
+        Array of class probabilities for each removed object
+    """
+    # Convert remove_ind to array if it's a single index
+    if isinstance(remove_ind, (int, np.integer)):
+        remove_ind = [remove_ind]
+
+    # Select the objects to be tested
+    use_testing = testing_data[remove_ind]
+    use_names = testing_names[remove_ind]
+
+    # Remove objects with the same names from the training set
+    use_idx = np.where(np.isin(training_names, use_names))[0]
+    use_training = np.delete(training_data, use_idx, axis=0)
+    use_class = np.delete(training_class, use_idx, axis=0)
+
+    # SMOTE the data
+    sampler = SMOTE(random_state=smote_state)
+    data_train_smote, class_train_smote = sampler.fit_resample(use_training, use_class)
+
+    # Train Random Forest Classifier
+    print(f'Training Classifier without indices {[i+1 for i in remove_ind]}...')
+    clf = RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth, random_state=clf_state)
+    clf.fit(data_train_smote, class_train_smote)
+
+    # Get the class probabilities for the removed objects
+    predicted_probs = clf.predict_proba(use_testing)
+
+    # If only one object was removed, return a single array, otherwise return a list of arrays
+    return predicted_probs[0] if len(predicted_probs) == 1 else predicted_probs
+
+
+def leave_one_out_parallel(training_data, training_class, training_names, testing_data, testing_class, testing_names,
+                           smote_state, n_estimators, max_depth, clf_state, num_processes=1, chunk_size=1):
+    """
+    Run leave-one-out cross-validation in parallel, removing chunk_size objects at a time
+    and training the classifier on the rest of the data.
+
+    Parameters
+    ----------
+    training_data : np.ndarray
+        The training data for the classifier.
+    training_class : np.ndarray
+        The training classes for the classifier.
+    training_names : np.ndarray
+        The AT names of each object in the table
+    testing_data : np.ndarray
+        The testing data for the classifier.
+    testing_class : np.ndarray
+        The testing classes for the classifier.
+    testing_names : np.ndarray
+        The AT names of each object in the table
+    smote_state : bool
+        The random seed for the SMOTE algorithm.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    clf_state : int
+        The random seed for the random forest classifier.
+    num_processes : int
+        Number of processes to use for parallel processing. Default is 1.
+    chunk_size : int
+        Number of items to remove at a time during leave-out. Default is 1.
+
+    Returns
+    -------
+    predicted_probs : list of numpy.ndarray
+        List of arrays containing class probabilities for each object in the training set.
+    """
+    # Create a partial function with fixed arguments
+    process_func = partial(leave_one_out,
+                           training_data=training_data,
+                           training_class=training_class,
+                           training_names=training_names,
+                           testing_data=testing_data,
+                           testing_class=testing_class,
+                           testing_names=testing_names,
+                           smote_state=smote_state,
+                           n_estimators=n_estimators,
+                           max_depth=max_depth,
+                           clf_state=clf_state)
+
+    # Create indices for all samples in the training data
+    indices = list(range(len(testing_data)))
+
+    # Create chunks of indices of size chunk_size
+    chunks = [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
+
+    # List to store the probability results for each sample
+    predicted_probs = [None] * len(testing_data)
+
+    # If single process, use simple loop for better debugging
+    if num_processes == 1:
+        for chunk in chunks:
+            chunk_results = process_func(chunk)
+            if len(chunk) == 1:
+                # Single result
+                predicted_probs[chunk[0]] = chunk_results
+            else:
+                # Multiple results
+                for i, idx in enumerate(chunk):
+                    predicted_probs[idx] = chunk_results[i]
+    else:
+        # Otherwise use Pool for parallel processing
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            # Map the function to all chunks
+            chunk_results = pool.map(process_func, chunks)
+
+            # Process the results
+            for chunk, results in zip(chunks, chunk_results):
+                if len(chunk) == 1:
+                    # Single result
+                    predicted_probs[chunk[0]] = results
+                else:
+                    # Multiple results
+                    for i, idx in enumerate(chunk):
+                        predicted_probs[idx] = results[i]
+
+    return predicted_probs
+
+
+def save_pickles(overwrite=False):
+    """
+    Function that creates and saves the optimal set of pickle files
+    for the classifiers. The optimal parameters are based on
+    the results of the random forest classifier.
+
+    Parameters
+    ----------
+    overwrite : bool
+        Whether to overwrite existing pickle files. Default is False.
+    """
+
+    # Optimal parameters shared among all classifiers
+    sorting_states = np.array([38, 39, 40, 41, 42])
+    clean = False
+    grouping = 11
+    n_estimators = 100
+
+    # Optimal parameters for the main late-time classifier
+    training_days = 75
+    max_depth = 15
+    features = 17
+    model = 'full'
+
+    # Create the pickle files
+    for state in sorting_states:
+        create_pickle(training_days, grouping, state, n_estimators, max_depth, state, state, features, model, clean,
+                      'main_late', overwrite=overwrite)
+
+    # Optimal parameters for the SLSN rapid classifier
+    training_days = 15
+    max_depth = 20
+    features = 17
+    model = 'full'
+
+    # Create the pickle files
+    for state in sorting_states:
+        create_pickle(training_days, grouping, state, n_estimators, max_depth, state, state, features, model, clean,
+                      'slsn_rapid', overwrite=overwrite)
+
+    # Optimal parameters for the TDE rapid classifier
+    training_days = 20
+    max_depth = 20
+    features = 17
+    model = 'full'
+
+    # Create the pickle files
+    for state in sorting_states:
+        create_pickle(training_days, grouping, state, n_estimators, max_depth, state, state, features, model, clean,
+                      'tde_rapid', overwrite=overwrite)
+
+
+def create_validation_table(training_days, testing_days, grouping, smote_state, n_estimators, max_depth, clf_state, sorting_state, features,
+                            model, clean, num_processes=1, chunk_size=1, output_dir='validations', overwrite=False, remove_bad=True):
+    """
+    Run the leave-one-out cross validation method on a testing set, and save or
+    return the output diagnosis table.
+
+    Parameters
+    ----------
+    training_days : float
+        The number of days of photometry to use for training.
+    testing_days : float
+        The number of days of photometry to use for testing.
+    grouping : str
+        The grouping of transient types to use for training.
+    smote_state : bool
+        The random seed for the SMOTE algorithm.
+    n_estimators : int
+        The number of trees in the random forest.
+    max_depth : int
+        The maximum depth of the trees in the random forest.
+    clf_state : int
+        The random seed for the random forest classifier.
+    sorting_state : bool
+        The random seed for the sorting algorithm.
+    features : int
+        The index of the feature list to use for training.
+    model : str, either 'single' or 'double'
+        The model to use for training.
+    clean : bool
+        Whether to require objects to have a host galaxy.
+    num_processes : int
+        Number of processes to use for parallel processing. Default is 1.
+    chunk_size : int
+        Number of items to remove at a time during leave-out. Default is 1.
+    output_dir : str
+        The name of the directory where to save validation tables.
+    overwrite : bool
+        Whether to overwrite existing pickle files. Default is False.
+    remove_bad : bool
+        Whether to remove bad objects from the training set. Default is True.
+    """
+
+    # Format the output name
+    name_format = f'{training_days}_{testing_days}_{grouping}_{smote_state}_{n_estimators}_{max_depth}_{clf_state}' + \
+                  f'_{sorting_state}_{features}_{model}_{clean}_{chunk_size}.txt'
+    output_name = os.path.join(output_dir, name_format)
+
+    if os.path.exists(output_name) and not overwrite:
+        print('Validation table already exists:', output_name)
+        return
+
+    # Format the training table
+    training_data, training_class, training_names, classes_names = format_training(training_days, grouping, sorting_state, features, model,
+                                                                                   clean=clean, remove_bad=remove_bad)
+
+    # Format the testing table
+    testing_data, testing_class, testing_names, classes_names = format_training(testing_days, grouping, sorting_state, features, model,
+                                                                                clean=clean, remove_bad=False)
+
+    # Predict classes using leave-one-out cross-validation
+    predicted_probs = leave_one_out_parallel(training_data, training_class, training_names,
+                                             testing_data, testing_class, testing_names,
+                                             smote_state=smote_state, n_estimators=n_estimators,
+                                             max_depth=max_depth, clf_state=clf_state, num_processes=num_processes,
+                                             chunk_size=chunk_size)
+
+    # Get the most likely predicted class of each object
+    predicted_classes = np.array([np.argmax(i) for i in predicted_probs])
+
+    # Save output table
+    used_classes = list(classes_names.keys())
+    output_table = table.Table(np.array(predicted_probs), names=used_classes)
+    testing_class_name = np.array(list(classes_names.keys()))[testing_class]
+    name_col = table.Table.Column(testing_names, name='object_name')
+    true_col = table.Table.Column(testing_class, name='true_class')
+    true_name_col = table.Table.Column(testing_class_name, name='true_class_name')
+    predicted_col = table.Table.Column(predicted_classes, name='predicted_class')
+    output_table.add_columns([name_col, true_col, true_name_col, predicted_col])
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_table.write(output_name, format='ascii', overwrite=overwrite)
+
+
+def predict_probability(info_table, prefix, features, model):
+    """
+    Predict the probability of each class for a given object.
+
+    Parameters
+    ----------
+    info_table : astropy.table.Table
+        The table containing the information about the object.
+    prefix : str
+        The prefix for the pickle file name.
+    features : list
+        The index of the feature list to use for training.
+    model : str, either 'single' or 'double'
+        The model to use for training.
+
+    Returns
+    -------
+    probability_avearge : numpy.ndarray
+        The average probability of each class.
+    probability_std : numpy.ndarray
+        The standard deviation of the probability of each class.
+    """
+
+    # Select the feature set
+    in_features = feature_set[features]
+
+    # Add the light curve decline for the double model
+    if model == 'double':
+        use_features = in_features + ['lc_decline_r', 'lc_decline_g']
+    else:
+        use_features = in_features
+
+    # Create the testing data
+    testing_data = np.array(info_table[use_features].to_pandas())
+
+    # Find pickle files
+    file_directory = os.path.join(fleet_data, f'{prefix}_*.pkl')
+    filenames = glob.glob(file_directory)
+
+    predicted_list = []  # Initialize an empty list
+
+    for i in range(len(filenames)):
+        filename = filenames[i]
+        with open(filename, 'rb') as f:
+            clf = pickle.load(f)
+        predicted = 100 * clf.predict_proba(testing_data)
+        predicted_list.append(predicted[0])
+
+    # Convert list to numpy array after the loop completes
+    predicted_array = np.array(predicted_list)
+
+    # Calculate the average and standard deviation
+    probability_avearge = np.average(predicted_array, axis=0)
+    probability_std = np.std(predicted_array, axis=0)
+
+    return probability_avearge, probability_std
+
+
+def create_info_table(parameters, output_table, data_catalog, **kwargs):
+    """
+    Creates a uniform table with all the information about the transient, host, light curve, fit, and input parameters.
+
+    Parameters
+    ----------
+    parameters : dict
+        The parameters from the fit_data function.
+    output_table : astropy.table.Table
+        The output light curve table from the fit_data function.
+    data_catalog : astropy.table.Table
+        The output galaxy catalog from the get_catalog function.
+    kwargs : dict
+        Additional parameters to include in the table.
+
+    Returns
+    -------
+    info_table : astropy.table.Table
+        A table containing information about the transient object.
+    """
+
+    # Create an Astropy Table table based on the parameters from parameters
+    data = {key: [value] for key, value in parameters.items()}
+    info_table = table.Table(data)
+
+    # Calculate the number of observations, detections, and detections used
+    lc_length = len(output_table)
+    detections = (output_table['UL'] == 'False') & (output_table['Ignore'] == 'False')
+    # Bound by phase_min and phase_max
+    phase_min = kwargs.get('phase_min')
+    phase_max = kwargs.get('phase_max')
+    used_length = np.sum((output_table['Phase_boom'] < phase_max) & (output_table['Phase_boom'] > phase_min) &
+                         (output_table['UL'] == 'False') & (output_table['Ignore'] == 'False'))
+    time_span = np.nanmax(output_table['MJD'][detections]) - np.nanmin(output_table['MJD'][detections])
+
+    info_table['lc_length'] = lc_length
+    info_table['det_length'] = np.sum(detections)
+    info_table['used_length'] = used_length
+    info_table['time_span'] = time_span
+
+    # Calculate the number of sources in the catalog, and whether there is SDSS and PSST data
+    if data_catalog:
+        num_sources = len(data_catalog)
+        has_sdss = 'gPSFMag_3pi' in data_catalog.columns
+        has_psst = 'psfMag_g_sdss' in data_catalog.columns
+        info_table['num_sources'] = num_sources
+        info_table['has_sdss'] = has_sdss
+        info_table['has_psst'] = has_psst
+
+    # Add all kwargs to the table with single-value lists
+    for key, value in kwargs.items():
+        info_table[key] = [value]
+
+    # Calculate delta time
+    bright_mjd = kwargs.get('bright_mjd')
+    first_mjd = kwargs.get('first_mjd')
+    delta_time = bright_mjd - first_mjd
+    info_table['delta_time'] = delta_time
+
+    # Calculate additional features
+    host_Pcc = kwargs.get('host_Pcc', None)
+    host_separation = kwargs.get('host_separation', None)
+    force_detection = kwargs.get('force_detection', None)
+    host_radius = kwargs.get('host_radius', None)
+    host_magnitude_g = kwargs.get('host_magnitude_g', None)
+    host_magnitude_r = kwargs.get('host_magnitude_r', None)
+    green_brightest = kwargs.get('green_brightest', None)
+    red_brightest = kwargs.get('red_brightest', None)
+
+    # Continue only if there was a catalog
+    if host_Pcc:
+        pcc_pcc_threshold = kwargs.get('pcc_pcc_threshold')
+        pcc_distance_threshold = kwargs.get('pcc_distance_threshold')
+        if (host_Pcc <= pcc_pcc_threshold) | ((host_Pcc <= 0.07) & (host_separation <= pcc_distance_threshold)) | force_detection:
+            input_separation = host_separation
+            input_size = host_radius
+            input_host_g_r = host_magnitude_g - host_magnitude_r
+            normal_separation = input_separation / input_size
+            deltamag_green = host_magnitude_g - green_brightest
+            deltamag_red = host_magnitude_r - red_brightest
+            hostless = False
+        else:
+            input_separation = 0.0
+            input_size = 0.0
+            normal_separation = 0.0
+            input_host_g_r = 0.0
+            deltamag_green = host_limit['g'] - green_brightest
+            deltamag_red = host_limit['r'] - red_brightest
+            hostless = True
+
+        # Add additional features to the table
+        info_table['input_separation'] = input_separation
+        info_table['input_size'] = input_size
+        info_table['input_host_g_r'] = input_host_g_r
+        info_table['normal_separation'] = normal_separation
+        info_table['deltamag_green'] = deltamag_green
+        info_table['deltamag_red'] = deltamag_red
+        info_table['hostless'] = hostless
+
+    # Add redshift labels
+    redshift = kwargs.get('redshift', None)
+    redshift_in = kwargs.get('redshift_in', None)
+    specz = kwargs.get('specz', None)
+    photoz = kwargs.get('photoz', None)
+
+    if redshift_in is not None:
+        redshift_use = redshift_in
+        redshift_label = 'Inputed'
+    elif redshift is not None:
+        redshift_use = redshift
+        redshift_label = 'TNS'
+    elif specz is not None:
+        redshift_use = specz
+        redshift_label = 'Specz'
+    elif photoz is not None:
+        redshift_use = photoz
+        redshift_label = 'Photoz'
+    else:
+        redshift_use = None
+        redshift_label = 'None'
+
+    # Add redshift labels to the table
+    info_table['redshift_use'] = redshift_use
+    info_table['redshift_label'] = redshift_label
+
+    # Calculate transient peak magnitude in r-band and g-band
+    if redshift_use and red_brightest:
+        absmag_r = calc_absmag(red_brightest, redshift_use)
+    else:
+        absmag_r = None
+    if redshift_use and green_brightest:
+        absmag_g = calc_absmag(green_brightest, redshift_use)
+    else:
+        absmag_g = None
+    info_table['absmag_r'] = absmag_r
+    info_table['absmag_g'] = absmag_g
 
     return info_table
 
-def predict_Host(object_name_in = '', ra_in = '', dec_in = '', redshift = np.nan, acceptance_radius = 3, import_ZTF = False, import_OSC = False, import_local = False, import_lightcurve = False, reimport_catalog = False,
-                 search_radius = 1.0, dust_map = 'SFD', Pcc_filter = 'i', Pcc_filter_alternative = 'r', star_separation = 1, star_cut = 0.1, date_range = np.inf, late_phase = 40, n_walkers = 50, n_steps = 1000,
-                 n_cores = 1, model = 'single', training_days = 20, hostless_cut = 0.1, sorting_state = 42, clean = 0, SMOTE_state = 42, clf_state = 42, n_estimators = 100, max_depth = 7, feature_set = 13,
-                 neighbors = 20, recalculate_nature = False, classifier = '', n_samples = 3, object_class = '', plot_lightcurve = True, do_observability = False, save_features = False, use_glade = False):
-    '''
-    Main Function to predict the probability of an object to be a Superluminous Supernovae
-    using the training set provided and a random forest algorithim. The function will query
-    the TNS, ZTF, and the OSC for data for the transient. And SDSS and 3PI for catalog data.
+
+def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, redshift_in=None, acceptance_radius=3, save_ztf=True,
+            download_ztf=True, download_osc=False, read_local=True, query_tns=False, save_lc=True, lc_dir='lightcurves',
+            read_existing=False, clean_ignore=True, dust_map='SFD', phase_min=-200, phase_max=75,
+            n_walkers=50, n_steps=70, n_cores=1, model='double', late_phase=40, default_err=0.1, default_decline_g=0.55,
+            default_decline_r=0.37, burn_in=0.75, sigma_clip=2, repeats=4, save_trace=False, save_lcplot=False, use_median=True,
+            search_radius=1.0, reimport_catalog=False, catalog_dir='catalogs', save_catalog=True, use_old=True, Pcc_filter='i',
+            Pcc_filter_alternative='r', neighbors=20, recalculate_nature=False, use_glade=False, best_index=None,
+            max_separation_glade=60.0, dimmest_glade=16.0, max_pcc_glade=0.01, max_distance_glade=1.0, star_separation=1.0,
+            star_cut=0.1, save_params=True, params_dir='parameters', classifier='all', plot_output=True, plot_dir='plots',
+            do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf',
+            match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True):
+    """
+    Predicts the classification of an object based on its name, right ascension, and declination.
 
     Parameters
-    -------------
-    object_name_in          : name of the transient (either ZTF, TNS, or other)
-    ra_in                   : R.A. in degrees or hms format
-    dec_in                  : Dec. in degrees or dms format
-    redshift                : redshift, only required for redshift classifier
-    acceptance_radius       : match objects for catalog cross-matching; in arcseconds
-    import_ZTF              : Import ZTF data (True) or read existing file (False)
-    import_OSC              : Import OSC data (True) or read existing file (False)
-    import_local            : Import local data from ./photometry directory
-    import_lightcurve       : Regenerate existing lightcurve file (True) or read
-                              the existing out from ./lightcurves (False)
-    reimport_catalog        : Overwrite the existing 3PI/SDSS catalog
-    search_radius           : Search radius in arcminutes for the 3PI/SDSS catalog
-    dust_map                : 'SF' or 'SFD', to query Schlafy and Finkbeiner 2011
-                              or Schlafy, Finkbeiner and Davis 1998.
-                              set to 'none' to not correct for extinction
-    Pcc_filter              : The effective magnitude, radius, and Pcc
-                              are calculated in this filter.
-    Pcc_filter_alternative  : If Pcc_filter is not found, use this one
-                              as an acceptable alternative.
-    star_separation         : A star needs to be this close to be matched
-                              to a transient [in Arcsec]
-    star_cut                : maximum allowed probability of an object to be a star
-    hostless_cut            : Only consider hosts with a Pcc lower than this
-    neighbors               : neighbors to use for star/galaxy separator
-    recalculate_nature      : Overwrite existing Nature column?
-    object_class            : Transient type, to overwrite any existing classes
-    plot_lightcurve         : Save an output plot with the light curve and PS1 image?
-    do_observability        : Calculate Observavility from Magellan and MMT?
-    use_glade               : Use the GLADE catalog to overwrite the best host
+    ----------
+    object_name_in : str
+        The name of the object to classify.
 
     Returns
-    ---------------
-    Predicted Probability to be ['AGN','SLSN-I','SLSN-II','SNII','SNIIb','SNIIn','SNIa','SNIbc','Star','TDE']
+    -------
+    info_table : astropy.table.Table
+        A table containing information about the transient object.
+    """
 
-    '''
     print('\n################# FLEET #################')
 
-    ########## Basic transient info ##########
-    ra_deg, dec_deg, transient_source, object_name, ztf_data, ztf_name, tns_name, object_class, osc_data = get_transient_info(object_name_in, ra_in, dec_in, object_class, acceptance_radius, import_ZTF, import_OSC, import_lightcurve)
+    # Empty variable
+    info_table = table.Table()
 
-    # If transient info failed, return empty
-    if ra_deg == '--':
-        print('Coordinates cannot be empty')
-        return table.Table()
-    # If transient is too south, return empty
-    if dec_deg <= -32:
-        print(f'dec = {dec_deg}, too low for SDSS or 3PI')
-        return table.Table()
-    # Else, print correctly
-    print('%s %s %s'%(object_name, ra_deg, dec_deg))
+    #########################
+    # Basic transient info #
+    #########################
+    ra_deg, dec_deg, transient_source, object_name, ztf_data, osc_data, local_data, ztf_name, tns_name, object_class, redshift = \
+        get_transient_info(object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in, object_class_in=object_class_in, redshift_in=redshift_in,
+                           acceptance_radius=acceptance_radius, save_ztf=save_ztf, download_ztf=download_ztf,
+                           download_osc=download_osc, read_local=read_local, query_tns=query_tns, ztf_dir=ztf_dir, lc_dir=lc_dir)
+    print('\nPredicting:', object_name)
 
-    ########## Catalog Operations ##########
-    data_catalog_out, catalog_exists = get_catalog(object_name, ra_deg, dec_deg, search_radius, dust_map, reimport_catalog)
-    # If there's no catalog, return empty
-    if len(data_catalog_out) == 0:
-        print('No data found in SDSS or 3PI')
-        return table.Table()
+    # Stop if it failed
+    if ra_deg is None:
+        print('Coordinates failed')
+        return info_table
+    elif dec_deg <= -32:
+        print('Coordinates are too far south')
+        return info_table
 
-    # Processing catalog data
-    print('Creating Catalog ...')
-    data_catalog = catalog_operations(object_name, data_catalog_out, ra_deg, dec_deg, Pcc_filter, Pcc_filter_alternative, neighbors, recalculate_nature, catalog_exists)
+    ####################
+    # Light curve info #
+    ####################
+    input_table = process_lightcurve(object_name, ra_deg=ra_deg, dec_deg=dec_deg, ztf_data=ztf_data, osc_data=osc_data,
+                                     local_data=local_data, save_lc=save_lc, lc_dir=lc_dir, read_existing=read_existing,
+                                     clean_ignore=clean_ignore, dust_map=dust_map)
 
+    # Stop if it failed
+    if input_table is None:
+        print('Light curve failed')
+        return info_table
+    elif len(input_table) == 0:
+        print('Light curve is empty')
+        return info_table
+    elif np.sum((input_table['UL'] == 'False') & (input_table['Ignore'] == 'False')) == 0:
+        print('No useable data in lightcurve')
+        return info_table
+
+    ###################
+    # Fit Light curve #
+    ###################
+    (parameters, color_peak, late_color, late_color10,
+     late_color20, late_color40, late_color60, first_to_peak_r,
+     first_to_peak_g, peak_to_last_r, peak_to_last_g,
+     bright_mjd, first_mjd, brightest_mag, green_brightest,
+     red_brightest, chi2, chains, output_table) = fit_data(input_table, phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps,
+                                                           n_cores=n_cores, model=model, late_phase=late_phase, default_err=default_err,
+                                                           default_decline_g=default_decline_g, default_decline_r=default_decline_r, burn_in=burn_in,
+                                                           sigma_clip=sigma_clip, repeats=repeats, save_trace=save_trace, save_lcplot=save_lcplot,
+                                                           use_median=use_median, object_name=object_name, plot_dir=plot_dir, n_sigma_limit=n_sigma_limit,
+                                                           emcee_progress=emcee_progress)
+
+    # If the fit failed
+    if (color_peak is None) or (green_brightest is None) or (red_brightest is None):
+        print('\nLight curve fit failed')
+
+        # Create quick info table
+        info_table = create_info_table(parameters, output_table, data_catalog=None, object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
+                                       object_class_in=object_class_in, redshift_in=redshift_in, acceptance_radius=acceptance_radius, save_ztf=save_ztf,
+                                       download_ztf=download_ztf, download_osc=download_osc, read_local=read_local, query_tns=query_tns, save_lc=save_lc,
+                                       read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
+                                       phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps, n_cores=n_cores,
+                                       model=model, late_phase=late_phase, default_err=default_err, default_decline_g=default_decline_g,
+                                       default_decline_r=default_decline_r, burn_in=burn_in, sigma_clip=sigma_clip, repeats=repeats,
+                                       use_median=use_median, search_radius=search_radius,
+                                       reimport_catalog=reimport_catalog, save_catalog=save_catalog, use_old=use_old,
+                                       Pcc_filter=Pcc_filter, Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,
+                                       recalculate_nature=recalculate_nature, use_glade=use_glade, best_index=best_index,
+                                       max_separation_glade=max_separation_glade, dimmest_glade=dimmest_glade, max_pcc_glade=max_pcc_glade,
+                                       max_distance_glade=max_distance_glade, star_separation=star_separation, star_cut=star_cut, ra_deg=ra_deg,
+                                       dec_deg=dec_deg, transient_source=transient_source, object_name=object_name, ztf_name=ztf_name,
+                                       tns_name=tns_name, object_class=object_class, redshift=redshift, color_peak=color_peak, late_color=late_color,
+                                       late_color10=late_color10, late_color20=late_color20, late_color40=late_color40, late_color60=late_color60,
+                                       first_to_peak_r=first_to_peak_r, first_to_peak_g=first_to_peak_g, peak_to_last_r=peak_to_last_r,
+                                       peak_to_last_g=peak_to_last_g, bright_mjd=bright_mjd, first_mjd=first_mjd, brightest_mag=brightest_mag,
+                                       green_brightest=green_brightest, red_brightest=red_brightest, chi2=chi2, save_params=save_params, classifier=classifier,
+                                       plot_output=plot_output, do_observability=do_observability, classify=classify,
+                                       include_het=include_het, pupil_fraction=pupil_fraction, minimum_halflight=minimum_halflight,
+                                       pcc_pcc_threshold=pcc_pcc_threshold, pcc_distance_threshold=pcc_distance_threshold, n_sigma_limit=n_sigma_limit)
+
+        # Create quick plot
+        if plot_output:
+            print('\nCreating quick plot...')
+            quick_plot(input_table, info_table, plot_dir=plot_dir)
+
+        # Save the info table
+        if save_params:
+            os.makedirs(params_dir, exist_ok=True)
+            params_path = f'{params_dir}/{object_name}_quick.txt'
+            info_table.write(params_path, format='ascii', overwrite=True)
+            print(f'\nInfo table saved to {params_path}')
+
+        return info_table
+
+    ######################
+    # Catalog Operations #
+    ######################
+    merged_catalog = get_catalog(object_name, ra_deg, dec_deg, search_radius=search_radius, reimport_catalog=reimport_catalog,
+                                 catalog_dir=catalog_dir, save_catalog=save_catalog, use_old=use_old,
+                                 match_radius_arcsec=match_radius_arcsec)
+
+    data_catalog = catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=Pcc_filter,
+                                      Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,
+                                      recalculate_nature=recalculate_nature, dust_map=dust_map,
+                                      minimum_halflight=minimum_halflight)
+
+    # Overwrite with GLADE if specified
     if use_glade:
-        best_host_glade = overwrite_glade(ra_deg, dec_deg, object_name, data_catalog)
-    else:
-        best_host_glade = np.nan
+        best_index = overwrite_with_glade(ra_deg, dec_deg, object_name, data_catalog,
+                                          max_separation_glade=max_separation_glade, dimmest_glade=dimmest_glade,
+                                          max_pcc_glade=max_pcc_glade, max_distance_glade=max_distance_glade)
 
-    ##### Find the Best host #####
-    host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g, host_magnitude_r, host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection = get_best_host(data_catalog, star_separation, star_cut, best_host_glade)
+    (host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude,
+     host_magnitude_g, host_magnitude_r, host_nature, photoz, photoz_err, specz,
+     specz_err, best_host, force_detection) = get_best_host(data_catalog, star_separation=star_separation,
+                                                            star_cut=star_cut, best_index=best_index,
+                                                            pcc_pcc_threshold=pcc_pcc_threshold,
+                                                            pcc_distance_threshold=pcc_distance_threshold)
 
-    # Define Appropriate Redshift
-    if np.isfinite(float(redshift)):
-        # User specified redshift
-        use_redshift   = float(redshift)
-        redshift_label = 'specz'
-    elif np.isfinite(float(specz)):
-        # Spectroscopic Redshift
-        use_redshift   = float(specz)
-        redshift_label = 'specz'
-    elif np.isfinite(float(photoz)):
-        # Photometric Redshift
-        use_redshift   = float(photoz)
-        redshift_label = 'photoz'
-    else:
-        # No Redshift
-        use_redshift   = np.nan
-        redshift_label = 'none'
+    # Get the nearest host galaxy
+    closest = np.nanargmin(data_catalog['separation'])
+    closest_radius = data_catalog['halflight_radius'][closest]
+    closest_separation = data_catalog['separation'][closest]
+    closest_ra = data_catalog['ra_matched'][closest]
+    closest_dec = data_catalog['dec_matched'][closest]
+    closest_Pcc = data_catalog['chance_coincidence'][closest]
+    closest_magnitude = data_catalog['effective_magnitude'][closest]
+    closest_magnitude_g = data_catalog['host_magnitude_g'][closest]
+    closest_magnitude_r = data_catalog['host_magnitude_r'][closest]
+    closest_nature = data_catalog['object_nature'][closest]
 
-    ########## Generate Features ##########
-    features_table = create_features(acceptance_radius,import_ZTF,import_OSC,import_local,import_lightcurve,reimport_catalog,search_radius,Pcc_filter,Pcc_filter_alternative,star_separation,star_cut,
-                                     date_range,late_phase,n_walkers,n_steps,n_cores,model,training_days,sorting_state,clean,SMOTE_state,clf_state,n_estimators,max_depth,feature_set,neighbors,
-                                     recalculate_nature,classifier,n_samples,plot_lightcurve,do_observability,save_features,ra_deg, dec_deg, transient_source, object_name,
-                                     object_name_in, ztf_name, tns_name, object_class, np.nan, np.nan, dust_map, np.nan, np.nan,
-                                     np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
-                                     np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g,
-                                     host_magnitude_r, host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection, use_redshift, redshift_label, hostless_cut)
+    # Create the info table
+    info_table = create_info_table(parameters, output_table, data_catalog, object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
+                                   object_class_in=object_class_in, redshift_in=redshift_in, acceptance_radius=acceptance_radius, save_ztf=save_ztf,
+                                   download_ztf=download_ztf, download_osc=download_osc, read_local=read_local, query_tns=query_tns, save_lc=save_lc,
+                                   read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
+                                   phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps, n_cores=n_cores,
+                                   model=model, late_phase=late_phase, default_err=default_err, default_decline_g=default_decline_g,
+                                   default_decline_r=default_decline_r, burn_in=burn_in, sigma_clip=sigma_clip, repeats=repeats,
+                                   use_median=use_median, search_radius=search_radius,
+                                   reimport_catalog=reimport_catalog, save_catalog=save_catalog, use_old=use_old,
+                                   Pcc_filter=Pcc_filter, Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,
+                                   recalculate_nature=recalculate_nature, use_glade=use_glade, best_index=best_index,
+                                   max_separation_glade=max_separation_glade, dimmest_glade=dimmest_glade, max_pcc_glade=max_pcc_glade,
+                                   max_distance_glade=max_distance_glade, star_separation=star_separation, star_cut=star_cut, ra_deg=ra_deg,
+                                   dec_deg=dec_deg, transient_source=transient_source, object_name=object_name, ztf_name=ztf_name,
+                                   tns_name=tns_name, object_class=object_class, redshift=redshift, color_peak=color_peak, late_color=late_color,
+                                   late_color10=late_color10, late_color20=late_color20, late_color40=late_color40, late_color60=late_color60,
+                                   first_to_peak_r=first_to_peak_r, first_to_peak_g=first_to_peak_g, peak_to_last_r=peak_to_last_r,
+                                   peak_to_last_g=peak_to_last_g, bright_mjd=bright_mjd, first_mjd=first_mjd, brightest_mag=brightest_mag,
+                                   green_brightest=green_brightest, red_brightest=red_brightest, chi2=chi2, host_radius=host_radius,
+                                   host_separation=host_separation, host_ra=host_ra, host_dec=host_dec, host_Pcc=host_Pcc, host_magnitude=host_magnitude,
+                                   host_magnitude_g=host_magnitude_g, host_magnitude_r=host_magnitude_r, host_nature=host_nature, photoz=photoz,
+                                   photoz_err=photoz_err, specz=specz, specz_err=specz_err, best_host=best_host, force_detection=force_detection,
+                                   save_params=save_params, classifier=classifier, plot_output=plot_output,
+                                   do_observability=do_observability, closest=closest, closest_radius=closest_radius, closest_separation=closest_separation,
+                                   closest_ra=closest_ra, closest_dec=closest_dec, closest_Pcc=closest_Pcc, closest_magnitude=closest_magnitude,
+                                   closest_magnitude_g=closest_magnitude_g, closest_magnitude_r=closest_magnitude_r, closest_nature=closest_nature,
+                                   classify=classify, include_het=include_het, pupil_fraction=pupil_fraction, minimum_halflight=minimum_halflight,
+                                   match_radius_arcsec=match_radius_arcsec, pcc_pcc_threshold=pcc_pcc_threshold,
+                                   pcc_distance_threshold=pcc_distance_threshold, n_sigma_limit=n_sigma_limit)
 
-    # Dummy Light Curve Table
-    output_names = ['MJD'    , 'Mag'    , 'MagErr' , 'Telescope', 'Filter', 'Source', 'UL'   , 'Ignore']
-    output_types = ['float64', 'float64', 'float64', 'S25'      , 'S25'   , 'S25'   , 'S25'  , 'S25'   ]
-    output_data  = [50000    , 20.0     , 0.1      , 'FLWO'     , 'r'     , 'FLWO'  , 'False', 'False' ]
-    output_table = table.Table(data = np.array(output_data).T, names = output_names, dtype = output_types)
+    ##################
+    # Classification #
+    ##################
+    if classify:
+        print('\nClassifying...')
+        if classifier == 'all':
+            late_probability_avearge, late_probability_std = predict_probability(info_table, prefix="main_late", features=17, model='full')
+            slsn_probability_avearge, slsn_probability_std = predict_probability(info_table, prefix="slsn_rapid", features=17, model='full')
+            tdes_probability_avearge, tdes_probability_std = predict_probability(info_table, prefix="tde_rapid", features=17, model='full')
 
-    # Return table here if this is the end
-    if save_features:
-        return features_table
+        # Define class labels
+        class_labels = ['AGN', 'SLSNI', 'SLSNII', 'SNII', 'SNIIb', 'SNIIn', 'SNIa', 'SNIbc', 'Star', 'TDE']
+
+        # Append probabilities and standard deviations to the info table
+        for i, label in enumerate(class_labels):
+            # Late-time classifier
+            info_table[f'P_late_{label}'] = late_probability_avearge[i]
+            info_table[f'P_late_{label}_std'] = late_probability_std[i]
+            # SLSN rapid classifier
+            info_table[f'P_rapid_slsn_{label}'] = slsn_probability_avearge[i]
+            info_table[f'P_rapid_slsn_{label}_std'] = slsn_probability_std[i]
+            # TDE rapid classifier
+            info_table[f'P_rapid_tde_{label}'] = tdes_probability_avearge[i]
+            info_table[f'P_rapid_tde_{label}_std'] = tdes_probability_std[i]
 
     # Calculate Observability
     if do_observability:
-        Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan, MMT_observable, Magellan_observable = calculate_observability(ra_deg, dec_deg, do_observability)
+        (telescope_arrays, dates_arrays, airmasses_arrays,
+         sun_elevations_arrays, observable_arrays) = calculate_observability(ra_deg, dec_deg, do_observability)
+        # Add observability to the info table
+        info_table['MMT_observable'] = observable_arrays[telescope_arrays.index('MMT')]
+        info_table['Magellan_observable'] = observable_arrays[telescope_arrays.index('Magellan')]
+        info_table['McDonald_observable'] = observable_arrays[telescope_arrays.index('McDonald')]
     else:
-        Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan = np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
+        telescope_arrays = []
+        dates_arrays = []
+        airmasses_arrays = []
+        sun_elevations_arrays = []
+        observable_arrays = []
+        info_table['MMT_observable'] = None
+        info_table['Magellan_observable'] = None
+        info_table['McDonald_observable'] = None
 
-    print('Plotting ...')
-    if plot_lightcurve:
-        first_mjd  = 50000
-        bright_mjd = 50000
-        make_plot(object_name + '_host', ra_deg, dec_deg, output_table, data_catalog, features_table, best_host, host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_nature, first_mjd, bright_mjd, search_radius, star_cut, Dates_MMT, Airmass_MMT, SunElevation_MMT, Dates_Magellan, Airmass_Magellan, SunElevation_Magellan, do_observability)
+    # Plot the results
+    if plot_output:
+        print('\nPlotting...')
+        os.makedirs(plot_dir, exist_ok=True)
+        make_plot(input_table, output_table, data_catalog, info_table, telescope_arrays, dates_arrays, airmasses_arrays, sun_elevations_arrays,
+                  plot_dir=plot_dir, do_observability=do_observability, include_het=include_het, pupil_fraction=pupil_fraction)
 
-    return features_table
+    # Save the info table
+    if save_params:
+        os.makedirs(params_dir, exist_ok=True)
+        params_path = f'{params_dir}/{object_name}.txt'
+        info_table.write(params_path, format='ascii', overwrite=True)
+        print(f'\nInfo table saved to {params_path}')
+
+    return info_table
+
+
+# Define the process_object function outside of create_training_set
+def _process_single_object(idx, all_objects, output_dir, phase_max, model, overwrite, skip_quick,
+                           download_ztf, **kwargs):
+    """Process a single object from the training set."""
+    # Read in the light curve
+    object_name_in = all_objects['Name'][idx]
+    ra_in = all_objects['RA'][idx]
+    dec_in = all_objects['DEC'][idx]
+    redshift_in = all_objects['Redshift'][idx]
+    object_class_in = all_objects['Classification'][idx]
+
+    # Check if quick exits
+    skip = False
+    if skip_quick:
+        if os.path.exists(f'{output_dir}/{object_name_in}_quick.txt'):
+            skip = True
+        else:
+            skip = False
+
+    # Run through FLEET
+    output_file = f'{output_dir}/{object_name_in}.txt'
+    if (os.path.exists(output_file) or skip) and not overwrite:
+        print(f'Training set already exists: {object_name_in}')
+        return None
+    else:
+        try:
+            return predict(object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
+                           object_class_in=object_class_in, redshift_in=redshift_in,
+                           phase_max=phase_max, model=model, params_dir=output_dir,
+                           query_tns=False, do_observability=False, classify=False,
+                           download_ztf=download_ztf, read_existing=True, **kwargs)
+        except Exception as e:
+            print(f"Error processing {object_name_in}: {e}")
+            return None
+
+
+def combine_training_set(params_dir, phase_max=None, model=None, overwrite_out=False):
+    """
+    Function that combines all tables created by create_training_set into one big table,
+    excluding '_quick.txt' files.
+
+    Parameters
+    ----------
+    params_dir : str
+        The directory to save the training set.
+    phase_max : int
+        The maximum phase to use for training.
+    model : str
+        The model to use for training.
+    overwrite_out : bool
+        Whether to overwrite the output combined table.
+    """
+
+    # Find all files
+    if (phase_max is None) and (model is None):
+        output_dir = f'{params_dir}'
+    else:
+        output_dir = f'{params_dir}_{model}_{phase_max}'
+    file_directory = os.path.join(output_dir, '*.txt')
+    filenames = glob.glob(file_directory)
+    filenames = [f for f in filenames if '_quick.txt' not in f]
+
+    # Get column names from the first file to set up the structure
+    with open(filenames[0], 'r') as f:
+        header = f.readline().strip()
+        column_names = header.split()
+
+    # Prepare lists to store each row's data
+    all_rows = []
+
+    # Process each file
+    for i, filename in enumerate(filenames):
+        with open(filename, 'r') as f:
+            # Skip header line
+            f.readline()
+            # Read data line (assuming one row per file)
+            data_line = f.readline().strip()
+            if data_line:  # Check if the line isn't empty
+                row_data = data_line.split()
+                if len(row_data) == len(column_names):  # Ensure the number of columns matches
+                    all_rows.append(row_data)
+                    print(f'Processed {filename} - {i+1}/{len(filenames)}')
+                else:
+                    print(f"Skipping {filename} due to column mismatch: expected {len(column_names)}, got {len(row_data)}")
+
+    # Create the final table directly from all rows
+    final_table = table.Table(rows=all_rows, names=column_names)
+
+    # Write output table
+    os.makedirs(params_dir, exist_ok=True)
+    if (phase_max is None) and (model is None):
+        combined_dir = f'{params_dir}/table_combined.txt'
+    else:
+        combined_dir = f'{params_dir}/table_{model}_{phase_max}.txt'
+    if not os.path.exists(combined_dir) or overwrite_out:
+        final_table.write(combined_dir, format='ascii', overwrite=True)
+        print(f"\nCombined {len(all_rows)} files into {combined_dir}")
+    else:
+        print(f"\nCombined file already exists: {combined_dir}")
+
+
+def create_training_set(phase_max=70, model='double', params_dir='training_set',
+                        overwrite=False, num_processes=1, object_list=None,
+                        skip_quick=False, overwrite_out=False, save_combined=True,
+                        download_ztf=False, all_objects=None, **kwargs):
+    """
+    Create a training set for the classifier based on a list of
+    classified transients. The training set is created by running
+    FLEET on each transient in the list and saving the results
+    to a table.
+
+    Parameters
+    ----------
+    phase_max : int
+        The maximum phase to use for training. Default is 70.
+    model : str
+        The model to use for training. Default is 'double'.
+        Can be 'single', 'double', or 'full'.
+    params_dir : str
+        The directory to save the training set. Default is 'training_set'.
+    overwrite : bool
+        Whether to overwrite existing training set files. Default is False.
+    num_processes : int
+        Number of processes to use for parallel processing. Default is 1.
+    object_list : list
+        List of objects to process. If None, all objects in the training set will be processed.
+    skip_quick : bool
+        Also remove the _quick files from the done files.
+    overwrite_out : bool
+        Whether to overwrite the output combined table
+    kwargs : dict
+        Additional parameters to pass to the predict function.
+    save_combined : bool
+        Whether to save the combined table after processing. Default is True.
+    download_ztf : bool
+        Whether or not to query Alerce
+    all_objects : astropy.Table
+        Table with input objects
+    """
+    # Read in the list of SNe that will be used for training
+    if all_objects is None:
+        reference_transients = pkg_resources.resource_filename(__name__, 'sne_best.txt')
+        all_objects = table.Table.read(reference_transients, format='ascii')
+        if object_list is not None:
+            all_objects = all_objects[np.isin(all_objects['Name'], object_list)]
+
+    # Set up output directory
+    output_dir = f'{params_dir}_{model}_{phase_max}'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Create a partial function with fixed arguments
+    process_func = partial(_process_single_object,
+                           all_objects=all_objects,
+                           output_dir=output_dir,
+                           phase_max=phase_max,
+                           model=model,
+                           overwrite=overwrite,
+                           skip_quick=skip_quick,
+                           download_ztf=download_ztf,
+                           **kwargs)
+
+    # If single process, use simple loop for better debugging
+    if num_processes == 1:
+        for i in range(len(all_objects)):
+            process_func(i)
+
+        # Combine all tables
+        if save_combined:
+            combine_training_set(params_dir, phase_max, model, overwrite_out)
+
+        return
+
+    # Otherwise use Pool for parallel processing
+    indices = list(range(len(all_objects)))
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        # Map the function to all indices
+        _ = pool.map(process_func, indices)
+
+    # Combine all tables
+    if save_combined:
+        combine_training_set(params_dir, phase_max, model, overwrite_out)

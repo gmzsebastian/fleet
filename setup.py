@@ -11,15 +11,16 @@ class InstallAndFetchDustMaps(install):
 
 
 setup(name='fleet-pipe',
-      version='1.0.0',
+      version='3.0.0',
       description='Finding Luminous and Exotic Extragalactic Transients',
       url='https://github.com/gmzsebastian/FLEET',
       author=['Sebastian Gomez'],
       author_email="sgomez@cfa.harvard.edu",
-      license='GNU GPL 3.0',
+      license='MIT',
       packages=['FLEET'],
-      package_data={'FLEET': ['training_set/*.txt', 'classification_catalog.dat', 'GLADE_short.txt']},
+      license_files=["LICENSE"],
       include_package_data=True,
+      package_data={'FLEET': ['training_set/*.txt', 'classification_catalog.dat', 'GLADE_short.txt']},
       #cmdclass={'install': InstallAndFetchDustMaps},
       install_requires=[
         'numpy',
@@ -49,4 +50,4 @@ setup(name='fleet-pipe',
         'mastcasjobs',
       ],
       test_suite='nose.collector',
-      zip_safe = False)
+      zip_safe=False)
