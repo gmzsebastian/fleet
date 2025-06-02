@@ -1,4 +1,3 @@
-# test
 import scipy.special as sp
 import os
 from matplotlib import gridspec
@@ -6,7 +5,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import emcee
 import warnings
-print('test')
 
 # Central wavelengths for ZTF and LSST filters
 ztf_refs = {'g': 4746.48,
