@@ -7,6 +7,11 @@ FLEET/fit.py
 FLEET/plot_curves.py
 FLEET/sne_best.txt
 FLEET/train.py
+fleet.egg-info/
+fleet/fit.py
+fleet/plot_curves.py
+fleet/sne_best.txt
+fleet/train.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

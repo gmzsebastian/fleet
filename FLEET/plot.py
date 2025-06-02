@@ -1,4 +1,4 @@
-from .model import linex, model_mag, filter_colors, ztf_refs, lsst_refs
+from .model import linex, model_mag, filter_colors, ztf_refs, lsst_refs, generic_refs
 from .catalog import sdss_refs, psst_refs, calc_separations
 import glob
 from astropy import table
@@ -881,7 +881,7 @@ def calc_HET_observability(Dates, info_table, pupil_fraction=0.3):
         HET_west = pyHETobs.TrackPupilSize.HET_Telescope(park_azimuth=optimal_azimuth_west)
 
     # Empty variable
-    max_area = np.zeros(len(Dates), dtype=bool)
+    max_area = np.zeros(len(Dates))
 
     for i in range(len(Dates)):
         obs_time = Dates[i]
@@ -899,7 +899,6 @@ def calc_HET_observability(Dates, info_table, pupil_fraction=0.3):
     # Create mask
     het_mask = np.zeros(len(Dates), dtype=bool)
     het_mask[max_area > full_pupil_area * pupil_fraction] = True
-
     return het_mask
 
 
@@ -1140,7 +1139,7 @@ def plot_field_image(sub_y, sub_x, sub_n, info_table, image_color='r', autoscale
 
 
 def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase=0, add_phase=0,
-                    plot_model=True, full_range=False, plot_comparison=True):
+                    plot_model=True, full_range=False, plot_comparison=True, plot_today=False):
     """
     Plot the light curve and model for a given transient
 
@@ -1167,6 +1166,8 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
         the relevant portion (False)
     plot_comparison : bool, default True
         If True, plot a comparison Ia light curve
+    plot_today : bool, default False
+        If True, plot the current date in the light curve
 
     Returns
     -------
@@ -1245,8 +1246,9 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
         mino, maxo = phase_minimum - subtract_phase, phase_maximum + add_phase
 
     # Making sure the min and max are not the same, otherwise who cares
-    if mino != maxo:
-        plt.xlim(mino, maxo)
+    if not plot_today:
+        if mino != maxo:
+            plt.xlim(mino, maxo)
 
     # Plot detections
     plt.errorbar(all_phases[detection][is_det_ztf], all_magnitudes[detection][is_det_ztf], all_sigmas[detection][is_det_ztf],
@@ -1309,10 +1311,11 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
     # Define filter references for LSST and ZTF
     if 'LSST' in used_sources:
         wavelengths = np.array([lsst_refs[i] for i in used_filters])
-    elif ('ZTF' in used_sources) or ('Alerce' in used_sources):
+    elif np.all(used_sources == 'ZTF') or ('Alerce' in used_sources):
         wavelengths = np.array([ztf_refs[i] for i in used_filters])
     else:
-        raise ValueError("Unknown telescope in data. Please check the input table.")
+        wavelengths = np.array([generic_refs[i] for i in used_filters])
+        print("Unknown or multiple telescopes in data. Adopting generic central wavelenghts.")
 
     # Plot fits to the data
     if plot_model and not full_range:
@@ -1367,6 +1370,14 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
     brightest_mag = info_table['brightest_mag'][0]
     if plot_comparison and not full_range and brightest_mag:
         plt.plot(phase_1a_model_r, magnitude_1a_model_r + brightest_mag, color='m', linestyle='--', linewidth=1)
+
+    # Plot today's MJD date
+    if plot_today:
+        today = Time(datetime.datetime.now()).mjd
+        # Days since latest observation
+        latest_phase = today - latest_mjd
+        plt.axvline(today, color='k', linestyle='--', linewidth=1.0, label=f'{latest_phase:.0f} days since latest')
+        plt.legend(loc='upper right')
 
     if not full_range:
         return used_filters, used_sources

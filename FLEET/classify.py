@@ -691,26 +691,161 @@ def create_info_table(parameters, output_table, data_catalog, **kwargs):
 def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, redshift_in=None, acceptance_radius=3, save_ztf=True,
             download_ztf=True, download_osc=False, read_local=True, query_tns=False, save_lc=True, lc_dir='lightcurves',
             read_existing=False, clean_ignore=True, dust_map='SFD', phase_min=-200, phase_max=75,
-            n_walkers=50, n_steps=70, n_cores=1, model='double', late_phase=40, default_err=0.1, default_decline_g=0.55,
+            n_walkers=50, n_steps=70, n_cores=1, model='full', late_phase=40, default_err=0.1, default_decline_g=0.55,
             default_decline_r=0.37, burn_in=0.75, sigma_clip=2, repeats=4, save_trace=False, save_lcplot=False, use_median=True,
             search_radius=1.0, reimport_catalog=False, catalog_dir='catalogs', save_catalog=True, use_old=True, Pcc_filter='i',
             Pcc_filter_alternative='r', neighbors=20, recalculate_nature=False, use_glade=False, best_index=None,
             max_separation_glade=60.0, dimmest_glade=16.0, max_pcc_glade=0.01, max_distance_glade=1.0, star_separation=1.0,
             star_cut=0.1, save_params=True, params_dir='parameters', classifier='all', plot_output=True, plot_dir='plots',
             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf',
-            match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True):
+            match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
+            running_live=False, osc_dir='osc', local_dir='photometry'):
     """
     Predicts the classification of an object based on its name, right ascension, and declination.
 
     Parameters
     ----------
-    object_name_in : str
-        The name of the object to classify.
+    object_name_in : str, optional
+        The name of the transient object to predict.
+    ra_in : float, optional
+        The right ascension of the transient object in degrees.
+    dec_in : float, optional
+        The declination of the transient object in degrees.
+    object_class_in : str, optional
+        The class of the transient object (e.g., 'SLSN-I', 'SLSN-II', etc.).
+    redshift_in : float, optional
+        The redshift of the transient object.
+    acceptance_radius : float, optional
+        The radius in arcseconds to accept the object for classification. Default is 3.
+    save_ztf : bool, optional
+        Whether to save the ZTF light curve data. Default is True.
+    download_ztf : bool, optional
+        Whether to download the ZTF light curve data. Default is True.
+    download_osc : bool, optional
+        Whether to download the OSC light curve data. Default is False.
+    read_local : bool, optional
+        Whether to read local light curve data. Default is True.
+    query_tns : bool, optional
+        Whether to query the TNS for transient information. Default is False.
+    save_lc : bool, optional
+        Whether to save the light curve data. Default is True.
+    lc_dir : str, optional
+        The directory to save the light curve data. Default is 'lightcurves'.
+    read_existing : bool, optional
+        Whether to read existing light curve data instead of downloading. Default is False.
+    clean_ignore : bool, optional
+        Whether to clean the light curve data by ignoring certain observations. Default is True.
+    dust_map : str, optional
+        The dust map to use for extinction correction. Default is 'SFD'.
+    phase_min : float, optional
+        The minimum phase in days to consider for the light curve fit. Default is -200.
+    phase_max : float, optional
+        The maximum phase in days to consider for the light curve fit. Default is 75.
+    n_walkers : int, optional
+        The number of walkers to use in the MCMC fit. Default is 50.
+    n_steps : int, optional
+        The number of steps to take in the MCMC fit. Default is 70.
+    n_cores : int, optional
+        The number of CPU cores to use for parallel processing. Default is 1.
+    model : str, optional
+        The model to use for the light curve fit. Options are 'full', 'single', or 'double'. Default is 'full'.
+    late_phase : int, optional
+        The late phase in days to consider for the light curve fit. Default is 40.
+    default_err : float, optional
+        The default error to use for the light curve data. Default is 0.1.
+    default_decline_g : float, optional
+        The default decline rate in the g-band for the light curve fit. Default is 0.55.
+    default_decline_r : float, optional
+        The default decline rate in the r-band for the light curve fit. Default is 0.37.
+    burn_in : float, optional
+        The fraction of steps to discard as burn-in in the MCMC fit. Default is 0.75.
+    sigma_clip : float, optional
+        The sigma clipping threshold to use for the light curve data. Default is 2.
+    repeats : int, optional
+        The number of times to repeat the MCMC fit. Default is 4.
+    save_trace : bool, optional
+        Whether to save the trace of the MCMC fit. Default is False.
+    save_lcplot : bool, optional
+        Whether to save the light curve plot. Default is False.
+    use_median : bool, optional
+        Whether to use the median of the light curve data for the fit. Default is True.
+    search_radius : float, optional
+        The search radius in arcminutes for finding host galaxies. Default is 1.0.
+    reimport_catalog : bool, optional
+        Whether to reimport the galaxy catalog. Default is False.
+    catalog_dir : str, optional
+        The directory to save the galaxy catalog. Default is 'catalogs'.
+    save_catalog : bool, optional
+        Whether to save the galaxy catalog. Default is True.
+    use_old : bool, optional
+        Whether to use the old galaxy catalog. Default is True.
+    Pcc_filter : str, optional
+        The filter to use for the PCC calculation. Default is 'i'.
+    Pcc_filter_alternative : str, optional
+        The alternative filter to use for the PCC calculation. Default is 'r'.
+    neighbors : int, optional
+        The number of neighbors to consider for the PCC calculation. Default is 20.
+    recalculate_nature : bool, optional
+        Whether to recalculate the nature of the transient object. Default is False.
+    use_glade : bool, optional
+        Whether to use the GLADE catalog for host galaxy matching. Default is False.
+    best_index : int, optional
+        The index of the best host galaxy to use from the GLADE catalog. Default is None.
+    max_separation_glade : float, optional
+        The maximum separation in arcseconds for the GLADE catalog. Default is 60.0.
+    dimmest_glade : float, optional
+        The dimmest magnitude in the GLADE catalog. Default is 16.0.
+    max_pcc_glade : float, optional
+        The maximum PCC value for the GLADE catalog. Default is 0.01.
+    max_distance_glade : float, optional
+        The maximum distance in Mpc for the GLADE catalog. Default is 1.0.
+    star_separation : float, optional
+        The separation in arcseconds to consider an object as a star. Default is 1.0.
+    star_cut : float, optional
+        The cut value for star classification. Default is 0.1.
+    save_params : bool, optional
+        Whether to save the parameters of the prediction. Default is True.
+    params_dir : str, optional
+        The directory to save the parameters. Default is 'parameters'.
+    classifier : str, optional
+        The classifier to use for the prediction. Options are 'all', 'slsn', 'tde', or 'hostless'. Default is 'all'.
+    plot_output : bool, optional
+        Whether to plot the output of the prediction. Default is True.
+    plot_dir : str, optional
+        The directory to save the plots. Default is 'plots'.
+    do_observability : bool, optional
+        Whether to calculate the observability of the transient object. Default is True.
+    include_het : bool, optional
+        Whether to include the HET in the observability calculation. Default is False.
+    pupil_fraction : float, optional
+        The fraction of the pupil to use for the observability calculation. Default is 0.3.
+    minimum_halflight : float, optional
+        The minimum half-light radius in arcseconds for the observability calculation. Default is 0.7.
+    classify : bool, optional
+        Whether to classify the transient object. Default is True.
+    ztf_dir : str, optional
+        The directory to save the ZTF data. Default is 'ztf'.
+    match_radius_arcsec : float, optional
+        The radius in arcseconds to match the transient object with the host galaxy. Default is 1.5.
+    pcc_pcc_threshold : float, optional
+        The PCC threshold to use for host galaxy classification. Default is 0.02.
+    pcc_distance_threshold : float, optional
+        The distance threshold in arcseconds to use for host galaxy classification. Default is 8.
+    n_sigma_limit : int, optional
+        The number of sigma to use for the limit in the light curve fit. Default is 3.
+    emcee_progress : bool, optional
+        Whether to show the progress of the MCMC fit. Default is True.
+    running_live : bool, optional
+        Whether the function is running live, default is False.
+    osc_dir : str, optional
+        The directory to save the OSC data. Default is 'osc'.
+    local_dir : str, optional
+        The directory to save the local photometry data. Default is 'photometry'.
 
     Returns
     -------
     info_table : astropy.table.Table
-        A table containing information about the transient object.
+        A table containing all information about the transient object.
     """
 
     print('\n################# FLEET #################')
@@ -724,15 +859,27 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     ra_deg, dec_deg, transient_source, object_name, ztf_data, osc_data, local_data, ztf_name, tns_name, object_class, redshift = \
         get_transient_info(object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in, object_class_in=object_class_in, redshift_in=redshift_in,
                            acceptance_radius=acceptance_radius, save_ztf=save_ztf, download_ztf=download_ztf,
-                           download_osc=download_osc, read_local=read_local, query_tns=query_tns, ztf_dir=ztf_dir, lc_dir=lc_dir)
+                           download_osc=download_osc, read_local=read_local, query_tns=query_tns, ztf_dir=ztf_dir, lc_dir=lc_dir,
+                           osc_dir=osc_dir, local_dir=local_dir)
     print('\nPredicting:', object_name)
+
+    if save_params:
+        os.makedirs(params_dir, exist_ok=True)
+        failed_path = f'{params_dir}/{object_name}_failed.txt'
+        failed_table = table.Table()
 
     # Stop if it failed
     if ra_deg is None:
         print('Coordinates failed')
+        if save_params:
+            failed_table.write(failed_path, format='ascii', overwrite=True)
+            print(f'\nFailed table saved to {failed_path}')
         return info_table
     elif dec_deg <= -32:
         print('Coordinates are too far south')
+        if save_params:
+            failed_table.write(failed_path, format='ascii', overwrite=True)
+            print(f'\nFailed table saved to {failed_path}')
         return info_table
 
     ####################
@@ -745,12 +892,21 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     # Stop if it failed
     if input_table is None:
         print('Light curve failed')
+        if save_params:
+            failed_table.write(failed_path, format='ascii', overwrite=True)
+            print(f'\nFailed table saved to {failed_path}')
         return info_table
     elif len(input_table) == 0:
         print('Light curve is empty')
+        if save_params:
+            failed_table.write(failed_path, format='ascii', overwrite=True)
+            print(f'\nFailed table saved to {failed_path}')
         return info_table
     elif np.sum((input_table['UL'] == 'False') & (input_table['Ignore'] == 'False')) == 0:
         print('No useable data in lightcurve')
+        if save_params:
+            failed_table.write(failed_path, format='ascii', overwrite=True)
+            print(f'\nFailed table saved to {failed_path}')
         return info_table
 
     ###################
@@ -973,7 +1129,8 @@ def _process_single_object(idx, all_objects, output_dir, phase_max, model, overw
             return None
 
 
-def combine_training_set(params_dir, phase_max=None, model=None, overwrite_out=False):
+def combine_training_set(params_dir, phase_max=None, model=None, overwrite_out=False,
+                         output_filename='table_combined'):
     """
     Function that combines all tables created by create_training_set into one big table,
     excluding '_quick.txt' files.
@@ -988,6 +1145,8 @@ def combine_training_set(params_dir, phase_max=None, model=None, overwrite_out=F
         The model to use for training.
     overwrite_out : bool
         Whether to overwrite the output combined table.
+    output_filename : str
+        The name of the output combined table file.
     """
 
     # Find all files
@@ -997,7 +1156,7 @@ def combine_training_set(params_dir, phase_max=None, model=None, overwrite_out=F
         output_dir = f'{params_dir}_{model}_{phase_max}'
     file_directory = os.path.join(output_dir, '*.txt')
     filenames = glob.glob(file_directory)
-    filenames = [f for f in filenames if '_quick.txt' not in f]
+    filenames = [f for f in filenames if ('_quick.txt' not in f) and ('_failed.txt' not in f)]
 
     # Get column names from the first file to set up the structure
     with open(filenames[0], 'r') as f:
@@ -1026,9 +1185,10 @@ def combine_training_set(params_dir, phase_max=None, model=None, overwrite_out=F
     final_table = table.Table(rows=all_rows, names=column_names)
 
     # Write output table
-    os.makedirs(params_dir, exist_ok=True)
     if (phase_max is None) and (model is None):
-        combined_dir = f'{params_dir}/table_combined.txt'
+        if output_filename.endswith('.txt'):
+            output_filename = output_filename[:-4]
+        combined_dir = f'{output_filename}.txt'
     else:
         combined_dir = f'{params_dir}/table_{model}_{phase_max}.txt'
     if not os.path.exists(combined_dir) or overwrite_out:

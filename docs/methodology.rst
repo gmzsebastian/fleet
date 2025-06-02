@@ -3,35 +3,8 @@
 Methodology
 ===========
 
-The core of ``fleet`` is handled by ``predict``.
+FLEET uses a random forest algorithm to predict whether a transient is most likely to be a SLSN or a TDE, for details of the methods see the ApJ papers:
 
-
-Predict
--------
-
-This is how dust works.
-
-Models
-~~~~~~
-
-These are models.
-
-.. math::
-
-   f(r|\nu,\sigma) = \frac{r}{\sigma^2} \exp\left(-\frac{r^2 + \nu^2}{2\sigma^2}\right) I_0\left(\frac{r\nu}{\sigma^2}\right)
-
-where:
-
-* :math:`r` is the measured separation
-* :math:`\nu` is the true separation
-* :math:`\sigma` is the measurement uncertainty
-* :math:`I_0` is the modified Bessel function of the first kind with order zero
-
-.. _example:
-
-.. figure:: images/2020kn.png
-   :alt: Example
-   :align: center
-   :width: 100%
-
-   **This is an example.** This is the example.
+* [1]: `original paper <https://ui.adsabs.harvard.edu/abs/2020ApJ...904...74G>`_ describing the algorithm and its application to superluminous supernovae (SLSNe).
+* [2]: `TDE paper <https://ui.adsabs.harvard.edu/abs/2023ApJ...949..113G>`_ describing the algorithm and its application to tidal disruption events (TDEs).
+* [3]: `updated paper <https://arxiv.org/abs/2210.10811>`_ describing the first two years of operations in search for SLSNe.

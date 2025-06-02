@@ -18,6 +18,18 @@ lsst_refs = {'u': 3751.20,
              'z': 8678.90,
              'y': 9711.82}
 
+generic_refs = {'u': 3751.20,
+                'g': 4740.66,
+                'r': 6172.34,
+                'i': 7500.97,
+                'z': 8678.90,
+                'y': 9711.82,
+                'U': 3659.88,
+                'B': 4380.74,
+                'V': 5445.43,
+                'R': 6411.47,
+                'I': 7982.09}
+
 # Define colors for each filter
 filter_colors = {
     'u': 'navy',
@@ -25,7 +37,12 @@ filter_colors = {
     'r': 'r',
     'i': 'maroon',
     'z': 'saddlebrown',
-    'y': 'indigo'
+    'y': 'indigo',
+    'U': 'navy',
+    'B': 'darkcyan',
+    'V': 'lawngreen',
+    'R': 'r',
+    'I': 'maroon',
 }
 
 # Define priors
@@ -659,11 +676,12 @@ def format_data(input_table, default_err=0.1, clean=True, remove_ul=False,
         if ('Telescope' in input_table.colnames and 'LSST' in input_table['Telescope']) or \
            ('Instrument' in input_table.colnames and 'LSST' in input_table['Instrument']):
             filter_refs = lsst_refs
-        elif ('Telescope' in input_table.colnames and 'ZTF' in input_table['Telescope']) or \
-             ('Instrument' in input_table.colnames and 'ZTF' in input_table['Instrument']):
+        elif ('Telescope' in input_table.colnames and np.all(input_table['Telescope'] == 'ZTF')) or \
+             ('Instrument' in input_table.colnames and np.all(input_table['Instrument'] == 'ZTF')):
             filter_refs = ztf_refs
         else:
-            raise ValueError("Unknown telescope in data. Please check the input table.")
+            filter_refs = generic_refs
+            print("Unknown or multiple telescopes in data. Adopting generic central wavelenghts.")
 
         # Add central wavelength column based on filter name
         input_table['Cenwave'] = [filter_refs[filter_name] for filter_name in input_table['Filter']]
@@ -843,12 +861,14 @@ def plot_model(input_table, last_samples, best_params, model, object_name,
        ('Instrument' in input_table.colnames and 'LSST' in input_table['Instrument']):
         filters_used = np.unique(output_table['Filter'])
         wavelengths = np.array([lsst_refs[i] for i in filters_used])
-    elif ('Telescope' in input_table.colnames and 'ZTF' in input_table['Telescope']) or \
-         ('Instrument' in input_table.colnames and 'ZTF' in input_table['Instrument']):
+    elif ('Telescope' in input_table.colnames and np.all(input_table['Telescope'] == 'ZTF')) or \
+         ('Instrument' in input_table.colnames and np.all(input_table['Instrument'] == 'ZTF')):
         filters_used = np.unique(output_table['Filter'])
         wavelengths = np.array([ztf_refs[i] for i in filters_used])
     else:
-        raise ValueError("Unknown telescope in data. Please check the input table.")
+        filters_used = np.unique(output_table['Filter'])
+        wavelengths = np.array([generic_refs[i] for i in filters_used])
+        print("\nUnknown or multiple telescopes in data. Adopting generic central wavelenghts.")
 
     for filter_name, filter_wave in zip(filters_used, wavelengths):
         mask = (output_table['Filter'] == filter_name)

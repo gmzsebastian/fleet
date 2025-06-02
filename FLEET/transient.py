@@ -1,4 +1,5 @@
-from .model import ztf_refs, lsst_refs
+import zipfile
+from .model import ztf_refs, lsst_refs, generic_refs
 from dustmaps.sfd import SFDQuery
 from collections import OrderedDict
 import json
@@ -12,6 +13,11 @@ import astropy.units as u
 from astropy import table
 from xml.etree import ElementTree
 from dust_extinction.parameter_averages import G23
+
+try:
+    fleet_data = os.environ['fleet_data']
+except KeyError:
+    fleet_data = os.path.join(os.path.dirname(__file__), 'data')
 
 # Define possible empty values
 empties = ['', ' ', 'None', '--', '-', b'', b' ', b'None', b'--', b'-', None, np.nan, 'nan', b'nan', '0', 0]
@@ -304,6 +310,10 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
         The light curve data in an Astropy table format
     """
 
+    # Empty default table
+    ztf_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'],
+                           dtype=['float64','float64','float64','str','str','str','str','float64','float64'])
+
     # Setup name and output file
     output_ztf_file = os.path.join(ztf_dir, f'{object_name}.txt')
     # Read existing data if it exists and download_ztf is False
@@ -316,6 +326,8 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
             ztf_name = header['ztf_name']
 
         return ztf_data, ztf_name
+    elif not download_ztf:
+        return ztf_data, ztf_name
 
     try:
         # Initialize Alerce client
@@ -327,12 +339,10 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
             lightcurve = client.query_lightcurve(ztf_name, format='pandas')
         else:
             print(f"No ZTF name found for {object_name}.")
-            ztf_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'])
             return ztf_data, ztf_name
 
     except Exception as e:
         print(f"Error querying light curve: {str(e)}")
-        ztf_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'])
         return ztf_data, ztf_name
 
     # If we have detections, convert to astropy table and get coordinates
@@ -417,7 +427,10 @@ def get_tns_credentials():
         return api_key, tns_id, username
 
     # Fall back to the key file in the user's home directory.
-    key_path = pathlib.Path.home() / 'tns_key.txt'
+    if os.path.exists(pathlib.Path.home() / 'tns_key.txt'):
+        key_path = pathlib.Path.home() / 'tns_key.txt'
+    else:
+        key_path = os.path.join(fleet_data, 'tns_key.txt')
     try:
         with open(key_path, 'r') as key_file:
             lines = [line.strip() for line in key_file if line.strip()]
@@ -426,6 +439,75 @@ def get_tns_credentials():
         return lines[0], lines[1], lines[2]
     except Exception as e:
         raise Exception("Error retrieving TNS credentials: " + str(e))
+
+
+def download_tns_public_objects(filename="tns_public_objects.csv"):
+    """
+    Downloads the CSV file containing all public TNS objects from the TNS API,
+    uncompresses the downloaded ZIP file, and saves the CSV file with the specified filename.
+
+    Parameters:
+    -----------
+    filename : str
+        The desired name for the CSV file (without the .csv extension).
+    """
+
+    # Check if the filename ends with .csv and remove it
+    if filename.endswith('.csv'):
+        filename = filename[:-4]
+
+    # Retrieve TNS credentials
+    api_key, tns_id, username = get_tns_credentials()
+
+    # Build the URL for the TNS public objects download endpoint
+    url = "https://www.wis-tns.org/system/files/tns_public_objects/tns_public_objects.csv.zip"
+
+    # Prepare the headers with the user-agent using the credentials
+    headers = {
+        'User-Agent': f'tns_marker{{"tns_id":{tns_id}, "type":"bot", "name":"{username}"}}'
+    }
+
+    # Prepare the data payload with the API key
+    payload = {
+        'api_key': api_key
+    }
+
+    try:
+        # Perform the POST request to download the file
+        print(f"Downloading public TNS objects to '{filename}.csv'...")
+        response = requests.post(url, data=payload, headers=headers)
+
+        # Check if the request was successful
+        response.raise_for_status()
+
+        # Write the content of the response to a ZIP file
+        zip_filename = 'tns_public_objects.csv.zip'
+        with open(zip_filename, 'wb') as f:
+            f.write(response.content)
+
+        print(f"Download completed successfully and saved as '{zip_filename}'.")
+
+        # Uncompress the ZIP file and save the CSV file with the specified filename
+        with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+            # Extract the first file in the ZIP archive (assuming there's only one file)
+            csv_filename = zip_ref.namelist()[0]
+            zip_ref.extract(csv_filename)
+
+            # Rename the extracted CSV file to the specified filename
+            os.rename(csv_filename, f"{filename}.csv")
+
+        print(f"CSV file saved as '{filename}.csv'.")
+
+        # Delete the ZIP file after extraction
+        os.remove(zip_filename)
+        print(f"Deleted the ZIP file '{zip_filename}'.")
+
+    except requests.RequestException as req_err:
+        print("HTTP Request error while downloading TNS public objects:", req_err)
+    except zipfile.BadZipFile as zip_err:
+        print("Error while extracting the ZIP file:", zip_err)
+    except Exception as e:
+        print("An unexpected error occurred:", e)
 
 
 def get_tns_coords_class(tns_name):
@@ -610,7 +692,8 @@ def get_osc_lightcurve(object_name, ra_deg=None, dec_deg=None, save_osc=True, os
     """
 
     # Empty default table
-    osc_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'])
+    osc_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'],
+                           dtype=['float64','float64','float64','str','str','str','str','float64','float64'])
 
     # Setup name and output file
     output_osc_file = os.path.join(osc_dir, f'{object_name}.txt')
@@ -683,7 +766,8 @@ def get_local_lightcurve(object_name, local_dir='photometry', read_local=True):
         The light curve data in an Astropy table format
     """
 
-    local_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'])
+    local_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'],
+                             dtype=['float64','float64','float64','str','str','str','str','float64','float64'])
 
     # Setup name and output file
     local_file = os.path.join(local_dir, f'{object_name}.txt')
@@ -707,7 +791,7 @@ def get_local_lightcurve(object_name, local_dir='photometry', read_local=True):
 
 def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, redshift_in=None,
                        acceptance_radius=3, save_ztf=True, download_ztf=True, download_osc=False, read_local=True,
-                       query_tns=True, ztf_dir='ztf', lc_dir='lightcurves'):
+                       query_tns=True, ztf_dir='ztf', lc_dir='lightcurves', osc_dir='osc', local_dir='photometry'):
     '''
     Get the coordinates and name for a transient. Either the coordinates
     and/or the name must be specified. The function will search for the
@@ -745,6 +829,10 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
         Directory to save the ZTF data to. Default is 'ztf'.
     lc_dir : str
         Directory to save the light curve data to. Default is 'lightcurves'.
+    osc_dir : str, default 'osc'
+        Directory where OSC data is stored
+    local_dir : str, default 'photometry'
+        Directory where local photometry data is stored
 
     Returns
     -------
@@ -792,8 +880,9 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
             object_name_in = object_name_in[2:]
         if object_name_in.startswith('SN'):
             object_name_in = object_name_in[2:]
-        if not os.path.exists(os.path.join(lc_dir, f'{object_name_in}.txt')):
-            print(f"Warning: {object_name_in} not found in {lc_dir}. Setting download_ztf to True.")
+        if ((not os.path.exists(os.path.join(lc_dir, f'{object_name_in}.txt'))) and (not os.path.exists(os.path.join(osc_dir, f'{object_name_in}.txt')))
+                    and (not os.path.exists(os.path.join(local_dir, f'{object_name_in}.txt')))):
+            print(f"Warning: {object_name_in} not found in {lc_dir}, {osc_dir}, or {local_dir}. Setting download_ztf to True.")
             download_ztf = True
 
     # If no coordinates or name were specified, raise an error
@@ -1031,6 +1120,11 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, os
     if os.path.exists(output_file) and read_existing:
         print('\nReading existing light curve data ...')
         input_table = table.Table.read(output_file, format='ascii')
+
+        # Ignore data if requested
+        if clean_ignore:
+            input_table = ignore_data(object_name, input_table)
+
         return input_table
     else:
         print('\nProcessing light curve data ...')
@@ -1104,11 +1198,12 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, os
     if ('Telescope' in input_table.colnames and 'LSST' in input_table['Telescope']) or \
        ('Instrument' in input_table.colnames and 'LSST' in input_table['Instrument']):
         filter_refs = lsst_refs
-    elif ('Telescope' in input_table.colnames and 'ZTF' in input_table['Telescope']) or \
-         ('Instrument' in input_table.colnames and 'ZTF' in input_table['Instrument']):
+    elif ('Telescope' in input_table.colnames and np.all(input_table['Telescope'] == 'ZTF')) or \
+         ('Instrument' in input_table.colnames and np.all(input_table['Instrument'] == 'ZTF')):
         filter_refs = ztf_refs
     else:
-        raise ValueError("Unknown telescope in data. Please check the input table.")
+        filter_refs = generic_refs
+        print("\nUnknown or multiple telescopes in data. Adopting generic central wavelenghts.")
 
     # Add central wavelength column based on filter name
     input_table['Cenwave'] = [filter_refs[filter_name] for filter_name in input_table['Filter']]

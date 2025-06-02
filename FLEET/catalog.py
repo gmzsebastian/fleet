@@ -15,6 +15,11 @@ import time
 from astropy import table
 import pkg_resources
 
+try:
+    fleet_data = os.environ['fleet_data']
+except KeyError:
+    fleet_data = os.path.join(os.path.dirname(__file__), 'data')
+
 # Central wavelengths for SDSS and 3PI filters
 sdss_refs = {'u': 3608.04, 'g': 4671.78, 'r': 6141.12, 'i': 7457.89, 'z': 8922.78}
 psst_refs = {'g': 4810.16, 'r': 6155.47, 'i': 7503.03, 'z': 8668.36, 'y': 9613.60}
@@ -183,7 +188,7 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
 
 
 def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
-               duplicate_distance=0.1, use_old=False,
+               duplicate_distance=0.1, use_old=True,
                timeout=60):
     """
     Query SDSS for objects within a search radius of given coordinates.
@@ -474,7 +479,7 @@ def query_sdss_redshift(ra_deg=None, dec_deg=None, objID=None, search_radius=3, 
 
 
 def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
-                    duplicate_distance=0.1, use_old=False):
+                    duplicate_distance=0.1, use_old=True):
     """
     Query PanSTARRS DR2 3π survey for objects within a search radius of given coordinates.
 
@@ -512,8 +517,12 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
         import pathlib
 
         # Get the PS1 MAST username and password from /Users/username/3PI_key.txt
-        key_location = os.path.join(pathlib.Path.home(), '3PI_key.txt')
-        wsid, password = np.genfromtxt(key_location, dtype='str')
+        try:
+            key_location = os.path.join(pathlib.Path.home(), '3PI_key.txt')
+            wsid, password = np.genfromtxt(key_location, dtype='str')
+        except Exception:
+            key_location = os.path.join(fleet_data, '3PI_key.txt')
+            wsid, password = np.genfromtxt(key_location, dtype='str')
 
         # 3PI query
         # Kron Magnitude and Radius, PSF Magnitude and radius, and sersic profile
@@ -927,7 +936,7 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
 
 
 def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalog=False,
-                catalog_dir='catalogs', save_catalog=True, use_old=False, match_radius_arcsec=1.5):
+                catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5):
     """
     Function to query SDSS and PSST catalogs, combine them, clean them, and return the merged catalog.
     Also save the output catalog to the catalog directory.

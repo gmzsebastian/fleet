@@ -1,7 +1,7 @@
 # import os
 # import pytest
 # import numpy as np
-from FLEET.model import (d_linex)
+from fleet.model import (d_linex)
 
 
 def test_d_linex():

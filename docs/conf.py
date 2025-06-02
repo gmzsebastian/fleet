@@ -90,5 +90,7 @@ latex_elements = {
 }
 
 # Example configuration for intersphinx: refer to the Python standard library.
-intersphinx_mapping = {'https://docs.python.org/3/': None}
+intersphinx_mapping = {
+    'python': ('https://docs.python.org/3', None)
+}
 nb_execution_mode = "off"  # Disable execution for MyST-NB
