@@ -1168,7 +1168,7 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
 
 def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalog=False,
                 catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5,
-                use_wise=True, wise_radius_arcsec=2.0):
+                use_wise=False, wise_radius_arcsec=2.0):
     """
     Function to query SDSS and PSST catalogs, combine them, clean them, and return the merged catalog.
     Also save the output catalog to the catalog directory.
@@ -1195,7 +1195,7 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
         Match radius in arcseconds for merging catalogs
     use_wise : bool
         If True, also query unWISE and append the W1 and W2 photometry
-        to the output catalog
+        to the output catalog. Default is False.
     wise_radius_arcsec : float
         Match radius in arcseconds between the catalog and unWISE
 

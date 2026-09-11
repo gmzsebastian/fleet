@@ -716,7 +716,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf', rubin_dir='rubin',
             match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
             running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False,
-            use_wise=True, wise_radius_arcsec=2.0):
+            use_wise=False, wise_radius_arcsec=2.0):
     """
     Predicts the classification of an object based on its name, right ascension, and declination.
 
@@ -874,7 +874,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     use_wise : bool, optional
         Whether to query unWISE and append the W1 and W2 photometry to the
         output catalog. The unWISE photometry is only saved, it is not used
-        anywhere else in FLEET. Default is True.
+        anywhere else in FLEET. Default is False, so the output catalogs are
+        unchanged unless this is turned on.
     wise_radius_arcsec : float, optional
         The radius in arcseconds to match catalog sources to unWISE. Default is 2.0.
 
