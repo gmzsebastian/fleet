@@ -715,7 +715,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
             star_cut=0.1, save_params=True, params_dir='parameters', classifier='all', plot_output=True, plot_dir='plots',
             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf', rubin_dir='rubin',
             match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
-            running_live=False, osc_dir='osc', local_dir='photometry'):
+            running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False):
     """
     Predicts the classification of an object based on its name, right ascension, and declination.
 
@@ -863,6 +863,13 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         The directory to save the OSC data. Default is 'osc'.
     local_dir : str, optional
         The directory to save the local photometry data. Default is 'photometry'.
+    download_forced : bool, optional
+        Whether to download the ZTF and Rubin forced photometry from Alerce and
+        save it to the light curve files with Source = 'Alerce-forced'. Default is False.
+    include_forced : bool, optional
+        Whether to actually use the forced photometry when fitting and classifying.
+        If False, any forced photometry is kept in the saved light curve files but
+        removed before FLEET uses the light curve. Default is False.
 
     Returns
     -------
@@ -882,7 +889,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         get_transient_info(object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in, object_class_in=object_class_in, redshift_in=redshift_in,
                            acceptance_radius=acceptance_radius, save_ztf=save_ztf, download_ztf=download_ztf,
                            download_osc=download_osc, save_rubin=save_rubin, download_rubin=download_rubin, read_local=read_local,
-                           query_tns=query_tns, ztf_dir=ztf_dir, rubin_dir=rubin_dir, lc_dir=lc_dir, osc_dir=osc_dir, local_dir=local_dir)
+                           query_tns=query_tns, ztf_dir=ztf_dir, rubin_dir=rubin_dir, lc_dir=lc_dir, osc_dir=osc_dir, local_dir=local_dir,
+                           download_forced=download_forced)
     print('\nPredicting:', object_name)
 
     if save_params:
@@ -909,7 +917,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     ####################
     input_table = process_lightcurve(object_name, ra_deg=ra_deg, dec_deg=dec_deg, ztf_data=ztf_data, rubin_data=rubin_data,
                                      osc_data=osc_data, local_data=local_data, save_lc=save_lc, lc_dir=lc_dir,
-                                     read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map)
+                                     read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
+                                     include_forced=include_forced)
 
     # Stop if it failed
     if input_table is None:
@@ -952,7 +961,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         # Create quick info table
         info_table = create_info_table(parameters, output_table, data_catalog=None, object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
                                        object_class_in=object_class_in, redshift_in=redshift_in, acceptance_radius=acceptance_radius, save_ztf=save_ztf,
-                                       download_ztf=download_ztf, download_osc=download_osc, download_rubin=download_rubin, save_rubin=save_rubin, read_local=read_local,
+                                       download_ztf=download_ztf, download_osc=download_osc, download_rubin=download_rubin, save_rubin=save_rubin,
+                                       download_forced=download_forced, include_forced=include_forced, read_local=read_local,
                                        query_tns=query_tns, save_lc=save_lc, read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
                                        phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps, n_cores=n_cores,
                                        model=model, late_phase=late_phase, default_err=default_err, default_decline_g=default_decline_g,
@@ -1028,6 +1038,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     info_table = create_info_table(parameters, output_table, data_catalog, object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
                                    object_class_in=object_class_in, redshift_in=redshift_in, acceptance_radius=acceptance_radius, save_ztf=save_ztf,
                                    save_rubin=save_rubin, download_ztf=download_ztf, download_rubin=download_rubin,
+                                   download_forced=download_forced, include_forced=include_forced,
                                    download_osc=download_osc, read_local=read_local, query_tns=query_tns, save_lc=save_lc,
                                    read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
                                    phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps, n_cores=n_cores,
