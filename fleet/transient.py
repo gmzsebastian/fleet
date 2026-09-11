@@ -611,8 +611,10 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
         print(f"Error querying light curve: {str(e)}")
         return ztf_data, ztf_name
 
-    # If we have detections, convert to astropy table and get coordinates
-    if ('detections' in lightcurve) and (not lightcurve.empty):
+    # If we have detections, convert to astropy table and get coordinates.
+    # The length check matters, an empty detections list has no columns to
+    # select and would raise a KeyError in the middle of a batch.
+    if ('detections' in lightcurve) and (not lightcurve.empty) and (len(lightcurve['detections'][0]) > 0):
         # Convert to Astropy table
         det = table.Table(lightcurve['detections'][0])['mjd', 'magpsf', 'sigmapsf', 'fid', 'ra', 'dec']
         if 'non_detections' in lightcurve:
@@ -1483,6 +1485,10 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
     local_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'])
     ztf_name = None
     rubin_name = None
+    # Track whether the name searches already ran, so objects with no
+    # counterpart are not queried twice
+    ztf_searched = False
+    rubin_searched = False
     tns_name = None
     object_class = None
     redshift = None
@@ -1542,9 +1548,11 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
 
             if download_ztf:
                 ztf_name = get_ztf_name(ra_deg, dec_deg, acceptance_radius)
+                ztf_searched = True
 
             if download_rubin:
                 rubin_name = get_rubin_name(ra_deg, dec_deg, acceptance_radius)
+                rubin_searched = True
 
             # Explicit user inputs should override queried class/redshift values
             if object_class_in is not None:
@@ -1614,10 +1622,12 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
             # Get ZTF name
             if download_ztf:
                 ztf_name = get_ztf_name(ra_deg, dec_deg, acceptance_radius)
+                ztf_searched = True
             
             # Get Rubin name
             if download_rubin:
                 rubin_name = get_rubin_name(ra_deg, dec_deg, acceptance_radius)
+                rubin_searched = True
 
     # Explicit user inputs should always be preserved, including for ZTF,
     # Rubin, and local/other objects.
@@ -1630,9 +1640,9 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
     # This lets ZTF-named objects pick up Rubin light curves and Rubin-named
     # objects pick up ZTF light curves when both are available.
     if ra_deg is not None and dec_deg is not None:
-        if download_ztf and ztf_name is None:
+        if download_ztf and ztf_name is None and not ztf_searched:
             ztf_name = get_ztf_name(ra_deg, dec_deg, acceptance_radius)
-        if download_rubin and rubin_name is None:
+        if download_rubin and rubin_name is None and not rubin_searched:
             rubin_name = get_rubin_name(ra_deg, dec_deg, acceptance_radius)
 
     # Query light curves from ZTF
