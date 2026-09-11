@@ -321,7 +321,7 @@ def remove_forced(input_table):
     return input_table[~is_forced]
 
 
-def get_ztf_forced(ztf_name):
+def get_ztf_forced(ztf_name, max_magerr=1.0, reject_negative=False):
     """
     Query the Alerce database to get the forced photometry of a ZTF object.
     The output has the same format as get_ztf_lightcurve, but the 'Source'
@@ -332,6 +332,18 @@ def get_ztf_forced(ztf_name):
     ----------
     ztf_name : str
         The ZTF object name to query
+    max_magerr : float, optional
+        Reject any forced photometry with an uncertainty larger than this,
+        in magnitudes (default: 1.0, which is roughly a S/N of 1). Use 0.36
+        for a 3-sigma cut. Forced photometry includes every epoch, most of
+        which are non-detections with very large errors, so some cut is
+        needed to avoid filling the light curve with noise.
+    reject_negative : bool, optional
+        Reject epochs flagged with isdiffpos = -1, i.e. negative
+        subtractions (default: False). This is off by default because
+        for some objects the real, high signal-to-noise forced photometry
+        is flagged this way, for example when the reference image was
+        built while the transient was bright.
 
     Returns
     -------
@@ -377,17 +389,18 @@ def get_ztf_forced(ztf_name):
     # Only keep sensible measurements
     good = np.isfinite(mjd) & np.isfinite(mag) & (mag > 0) & (mag < 30)
 
-    # Reject negative subtractions, if that column exists
-    if 'isdiffpos' in forced_table.colnames:
+    # Reject anything with a large uncertainty, these are the epochs where
+    # nothing was detected and the forced photometry is just noise
+    good &= np.isfinite(mag_err) & (mag_err > 0) & (mag_err < max_magerr)
+
+    # Optionally reject negative subtractions, if that column exists
+    if reject_negative and ('isdiffpos' in forced_table.colnames):
         isdiffpos = np.array([str(i).strip().lower() for i in forced_table['isdiffpos']])
         good &= ~np.isin(isdiffpos, ['-1', '-1.0', 'f', 'false', '0', 'nan', 'none'])
 
     if np.sum(good) == 0:
         print('No useable ZTF forced photometry found.')
         return forced_data
-
-    # Assign a default error to any missing uncertainties
-    mag_err[~np.isfinite(mag_err) | (mag_err <= 0)] = 0.1
 
     # Filter names, fid can be either 1/2/3 or g/r/i
     filter_map = {'1': 'g', '2': 'r', '3': 'i', '1.0': 'g', '2.0': 'r', '3.0': 'i'}
@@ -424,7 +437,7 @@ def get_ztf_forced(ztf_name):
     return forced_data
 
 
-def get_rubin_forced(rubin_name):
+def get_rubin_forced(rubin_name, max_magerr=1.0):
     """
     Query the Alerce database to get the forced photometry of a Rubin/LSST
     object. The output has the same format as get_rubin_lightcurve, but the
@@ -438,6 +451,10 @@ def get_rubin_forced(rubin_name):
     ----------
     rubin_name : str
         The Rubin/LSST object name to query
+    max_magerr : float, optional
+        Reject any forced photometry with an uncertainty larger than this,
+        in magnitudes (default: 1.0, which is roughly a S/N of 1). Use 0.36
+        for a 3-sigma cut.
 
     Returns
     -------
@@ -497,15 +514,19 @@ def get_rubin_forced(rubin_name):
     # Only keep positive fluxes with real errors
     is_detection = np.isfinite(mjd) & np.isfinite(flux) & (flux > 0.0)
 
+    # Reject low signal-to-noise epochs, most forced photometry is a
+    # non-detection and would otherwise fill the light curve with noise
+    with np.errstate(divide='ignore', invalid='ignore'):
+        all_mag_err = (2.5 / np.log(10.0)) * flux_err / flux
+    is_detection &= np.isfinite(all_mag_err) & (all_mag_err > 0) & (all_mag_err < max_magerr)
+
     if np.sum(is_detection) == 0:
         print('No useable Rubin forced photometry found.')
         return forced_data
 
     # Convert flux to magnitudes
     det_mag = -2.5 * np.log10(flux[is_detection]) + 31.4
-    with np.errstate(divide='ignore', invalid='ignore'):
-        det_mag_err = (2.5 / np.log(10.0)) * flux_err[is_detection] / flux[is_detection]
-    det_mag_err[~np.isfinite(det_mag_err) | (det_mag_err <= 0)] = 0.1
+    det_mag_err = all_mag_err[is_detection]
 
     n_good = int(np.sum(is_detection))
     forced_data = table.Table(data=[mjd[is_detection],
