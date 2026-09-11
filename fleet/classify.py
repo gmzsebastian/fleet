@@ -715,7 +715,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
             star_cut=0.1, save_params=True, params_dir='parameters', classifier='all', plot_output=True, plot_dir='plots',
             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf', rubin_dir='rubin',
             match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
-            running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False):
+            running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False,
+            use_wise=True, wise_radius_arcsec=2.0):
     """
     Predicts the classification of an object based on its name, right ascension, and declination.
 
@@ -870,6 +871,12 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         Whether to actually use the forced photometry when fitting and classifying.
         If False, any forced photometry is kept in the saved light curve files but
         removed before FLEET uses the light curve. Default is False.
+    use_wise : bool, optional
+        Whether to query unWISE and append the W1 and W2 photometry to the
+        output catalog. The unWISE photometry is only saved, it is not used
+        anywhere else in FLEET. Default is True.
+    wise_radius_arcsec : float, optional
+        The radius in arcseconds to match catalog sources to unWISE. Default is 2.0.
 
     Returns
     -------
@@ -1002,7 +1009,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     ######################
     merged_catalog = get_catalog(object_name, ra_deg, dec_deg, search_radius=search_radius, reimport_catalog=reimport_catalog,
                                  catalog_dir=catalog_dir, save_catalog=save_catalog, use_old=use_old,
-                                 match_radius_arcsec=match_radius_arcsec)
+                                 match_radius_arcsec=match_radius_arcsec, use_wise=use_wise,
+                                 wise_radius_arcsec=wise_radius_arcsec)
 
     data_catalog = catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=Pcc_filter,
                                       Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,

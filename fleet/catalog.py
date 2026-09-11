@@ -36,6 +36,10 @@ survey_limits = {'gPSFMag_3pi': 23.64,
                  'psfMag_i_sdss': 22.04,
                  'psfMag_z_sdss': 21.58}
 
+# Vega to AB offsets for unWISE, AB = Vega + offset
+# Set these to 0.0 to store Vega magnitudes instead
+unwise_AB_offsets = {'W1': 2.699, 'W2': 3.339}
+
 # Default limits for host galaxy mags
 host_limit = {'u': 23.42,
               'g': 23.64,
@@ -728,9 +732,13 @@ def query_gaia(ra_deg, dec_deg, search_radius=1.0, DR=3, gaia_limit=10, use_vizi
 
         return catalog_gaia
 
-def query_wise(ra_deg, dec_deg, search_radius=1.0, data_table="allwise_p3as_psd"):
+def query_wise(ra_deg, dec_deg, search_radius=1.0, data_table="unwise_2019"):
     """
-    Query WISE for objects within a search radius of given coordinates.
+    Query the unWISE catalog for objects within a search radius of given
+    coordinates. unWISE is deeper than AllWISE and only covers W1 and W2.
+    The table is band merged, so band 1 (W1) and band 2 (W2) are stored in
+    columns ending in '_1' and '_2', and the photometry is a flux in Vega
+    nanomaggies rather than a magnitude.
 
     Parameters
     ----------
@@ -739,27 +747,188 @@ def query_wise(ra_deg, dec_deg, search_radius=1.0, data_table="allwise_p3as_psd"
     dec_deg : float
         Declination in degrees
     search_radius : float
-        Search radius in arcsec
+        Search radius in arcmin
     data_table : str
-        Name of the WISE data table to query
+        Name of the unWISE data table to query
 
     Returns
     -------
     catalog_wise : astropy.table.Table or None
-        Table containing WISE data
+        Table containing unWISE data, with '_wise' appended to
+        every column name. None if the query failed.
     """
 
-    # Query Catalog
     coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.degree, u.degree), frame='icrs')
-    catalog_wise = Irsa.query_region(
-        coordinates=coord,
-        catalog=data_table,
-        spatial="Cone",
-        radius=u.Quantity(search_radius, u.arcsec),
-        columns="designation,ra,dec,sigra,sigdec,sigradec,w1mag,w1sigm,w2mag,w2sigm,w3mag,w3sigm,w4mag,w4sigm"
-    )
 
+    try:
+        print('Querying unWISE ...')
+        # Every column is requested instead of a list, because some unWISE
+        # column names ('primary') are reserved SQL words and make the
+        # generated ADQL invalid. Only the columns used below are read.
+        catalog_wise = Irsa.query_region(
+            coord,
+            catalog=data_table,
+            spatial="Cone",
+            radius=u.Quantity(search_radius, u.arcmin),
+            columns="*"
+        )
+    except Exception as e:
+        print(f"Error querying unWISE: {str(e)}")
+        return None
+
+    if catalog_wise is None or len(catalog_wise) == 0:
+        print('Found 0 objects\n')
+        return None
+
+    # Sources land in more than one coadd, only keep the primary entry
+    if 'primary' in catalog_wise.colnames:
+        is_primary = _wise_floats(catalog_wise, 'primary') == 1
+        if np.any(is_primary):
+            catalog_wise = catalog_wise[is_primary]
+
+    # Add '_wise' suffix to all column names
+    for col in catalog_wise.colnames:
+        catalog_wise.rename_column(col, f"{col}_wise")
+
+    print(f'Found {len(catalog_wise)} objects\n')
     return catalog_wise
+
+
+def merge_wise(merged_catalog, catalog_wise, match_radius_arcsec=2.0, snr_limit=2.0):
+    """
+    Add the unWISE photometry to an existing catalog by matching on
+    coordinates. Every row of merged_catalog gets W1 and W2 magnitudes and
+    errors. Rows with no unWISE match within match_radius_arcsec are filled
+    with NaN.
+
+    unWISE has no ph_qual or cc_flags columns, so a band is called an upper
+    limit when its signal to noise is below snr_limit. In that case the
+    reported magnitude is the snr_limit-sigma limiting magnitude and the
+    error is NaN, which is the same convention AllWISE uses for ph_qual 'U'.
+    The quality factor, blending fraction, and artifact flags are carried
+    through so they can be checked later.
+
+    Magnitudes are AB, converted from Vega with the offsets in
+    unwise_AB_offsets. Set those to 0.0 for Vega magnitudes instead.
+
+    Parameters
+    ----------
+    merged_catalog : astropy.table.Table
+        Catalog with ra_matched and dec_matched columns
+    catalog_wise : astropy.table.Table or None
+        Output of query_wise
+    match_radius_arcsec : float
+        Maximum separation in arcsec to call it a match
+    snr_limit : float
+        Signal to noise below which a band is called an upper limit
+
+    Returns
+    -------
+    merged_catalog : astropy.table.Table
+        The same catalog with the unWISE columns appended
+    """
+
+    # Band 1 is W1 and band 2 is W2 in the unWISE table
+    bands = {'W1': '1', 'W2': '2'}
+    n_rows = len(merged_catalog)
+
+    # Empty columns, used if there is no unWISE data at all
+    for band in bands:
+        merged_catalog[f'{band}_AB_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_AB_err_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_limit_wise'] = np.array(['False'] * n_rows, dtype='U5')
+        merged_catalog[f'{band}_qf_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_fracflux_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_flags_wise'] = np.full(n_rows, np.nan)
+    # This needs enough width for the real values, otherwise it gets truncated
+    merged_catalog['unwise_objid_wise'] = np.array(['--'] * n_rows, dtype='U32')
+    merged_catalog['separation_wise'] = np.full(n_rows, np.nan)
+
+    if catalog_wise is None or len(catalog_wise) == 0 or n_rows == 0:
+        print('No unWISE data, the W1 and W2 columns will be empty.\n')
+        return merged_catalog
+
+    # Match the two catalogs
+    coords_catalog = SkyCoord(ra=np.array(merged_catalog['ra_matched'], dtype=float) * u.deg,
+                              dec=np.array(merged_catalog['dec_matched'], dtype=float) * u.deg)
+    coords_wise = SkyCoord(ra=np.array(catalog_wise['ra_wise'], dtype=float) * u.deg,
+                           dec=np.array(catalog_wise['dec_wise'], dtype=float) * u.deg)
+    idx_wise, d2d, _ = match_coordinates_sky(coords_catalog, coords_wise)
+    matched = d2d < match_radius_arcsec * u.arcsec
+
+    if not np.any(matched):
+        print('No unWISE matches found.\n')
+        return merged_catalog
+
+    # Pull out the matched unWISE rows
+    wise_matched = catalog_wise[idx_wise[matched]]
+
+    for band, suffix in bands.items():
+        flux = _wise_floats(wise_matched, f'flux_{suffix}_wise')
+        flux_err = _wise_floats(wise_matched, f'dflux_{suffix}_wise')
+
+        # Anything below the signal to noise cut becomes an upper limit
+        with np.errstate(divide='ignore', invalid='ignore'):
+            snr = flux / flux_err
+        good_error = np.isfinite(flux_err) & (flux_err > 0)
+        is_detection = np.isfinite(flux) & (flux > 0) & good_error & (snr >= snr_limit)
+        is_limit = good_error & ~is_detection
+
+        # Vega nanomaggies to magnitudes, then to AB
+        mags = np.full(len(wise_matched), np.nan)
+        errs = np.full(len(wise_matched), np.nan)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mags[is_detection] = 22.5 - 2.5 * np.log10(flux[is_detection])
+            errs[is_detection] = (2.5 / np.log(10.0)) * flux_err[is_detection] / flux[is_detection]
+            # For a non-detection report the limiting magnitude instead
+            mags[is_limit] = 22.5 - 2.5 * np.log10(snr_limit * flux_err[is_limit])
+        mags += unwise_AB_offsets[band]
+
+        merged_catalog[f'{band}_AB_wise'][matched] = mags
+        merged_catalog[f'{band}_AB_err_wise'][matched] = errs
+        merged_catalog[f'{band}_limit_wise'][matched] = np.where(is_limit, 'True', 'False')
+        merged_catalog[f'{band}_qf_wise'][matched] = _wise_floats(wise_matched, f'qf_{suffix}_wise')
+        merged_catalog[f'{band}_fracflux_wise'][matched] = _wise_floats(wise_matched, f'fracflux_{suffix}_wise')
+        merged_catalog[f'{band}_flags_wise'][matched] = _wise_floats(wise_matched, f'flags_unwise_{suffix}_wise')
+
+    merged_catalog['unwise_objid_wise'][matched] = _wise_strings(wise_matched, 'unwise_objid_wise')
+    merged_catalog['separation_wise'][matched] = d2d[matched].arcsec
+
+    print(f'Matched {int(np.sum(matched))} objects to unWISE\n')
+    return merged_catalog
+
+
+def _wise_floats(catalog_wise, column_name):
+    """
+    Return a WISE column as floats, with NaN for anything missing.
+    The column is converted to float before the mask is applied, because
+    some unWISE columns are integers and NaN cannot be used to fill those.
+    """
+    if column_name not in catalog_wise.colnames:
+        return np.full(len(catalog_wise), np.nan)
+
+    column = catalog_wise[column_name]
+    values = np.array(column, dtype=float)
+    values[np.ma.getmaskarray(column)] = np.nan
+    return values
+
+
+def _wise_strings(catalog_wise, column_name):
+    """Return a WISE column as strings, with '--' for anything missing."""
+    if column_name not in catalog_wise.colnames:
+        return np.array(['--'] * len(catalog_wise))
+
+    column = catalog_wise[column_name]
+    mask = np.ma.getmaskarray(column)
+
+    values = []
+    for value, is_masked in zip(np.array(column, dtype=object), mask):
+        if isinstance(value, bytes):
+            value = value.decode()
+        text = '' if is_masked else str(value).strip()
+        values.append(text if text else '--')
+
+    return np.array(values)
 
 
 def query_2mass(ra_deg, dec_deg, search_radius=1.0):
@@ -998,7 +1167,8 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
 
 
 def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalog=False,
-                catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5):
+                catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5,
+                use_wise=True, wise_radius_arcsec=2.0):
     """
     Function to query SDSS and PSST catalogs, combine them, clean them, and return the merged catalog.
     Also save the output catalog to the catalog directory.
@@ -1023,6 +1193,11 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
         If True, use the old version of the query that requires an API key
     match_radius_arcsec : float
         Match radius in arcseconds for merging catalogs
+    use_wise : bool
+        If True, also query unWISE and append the W1 and W2 photometry
+        to the output catalog
+    wise_radius_arcsec : float
+        Match radius in arcseconds between the catalog and unWISE
 
     Returns
     -------
@@ -1062,6 +1237,12 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
 
     # Sort the catalog by separation
     merged_catalog.sort('separation')
+
+    # Append the unWISE photometry
+    if use_wise:
+        catalog_wise = query_wise(ra_deg, dec_deg, search_radius=search_radius)
+        merged_catalog = merge_wise(merged_catalog, catalog_wise,
+                                    match_radius_arcsec=wise_radius_arcsec)
 
     # Save the merged catalog to the specified directory
     if save_catalog:

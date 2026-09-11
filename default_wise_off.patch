@@ -1,0 +1,45 @@
+diff --git a/fleet/catalog.py b/fleet/catalog.py
+index ec11f1b..6836683 100644
+--- a/fleet/catalog.py
++++ b/fleet/catalog.py
+@@ -1168,7 +1168,7 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
+ 
+ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalog=False,
+                 catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5,
+-                use_wise=True, wise_radius_arcsec=2.0):
++                use_wise=False, wise_radius_arcsec=2.0):
+     """
+     Function to query SDSS and PSST catalogs, combine them, clean them, and return the merged catalog.
+     Also save the output catalog to the catalog directory.
+@@ -1195,7 +1195,7 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
+         Match radius in arcseconds for merging catalogs
+     use_wise : bool
+         If True, also query unWISE and append the W1 and W2 photometry
+-        to the output catalog
++        to the output catalog. Default is False.
+     wise_radius_arcsec : float
+         Match radius in arcseconds between the catalog and unWISE
+ 
+diff --git a/fleet/classify.py b/fleet/classify.py
+index 1d17e8b..b44b853 100644
+--- a/fleet/classify.py
++++ b/fleet/classify.py
+@@ -716,7 +716,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None,
+             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf', rubin_dir='rubin',
+             match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
+             running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False,
+-            use_wise=True, wise_radius_arcsec=2.0):
++            use_wise=False, wise_radius_arcsec=2.0):
+     """
+     Predicts the classification of an object based on its name, right ascension, and declination.
+ 
+@@ -874,7 +874,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None,
+     use_wise : bool, optional
+         Whether to query unWISE and append the W1 and W2 photometry to the
+         output catalog. The unWISE photometry is only saved, it is not used
+-        anywhere else in FLEET. Default is True.
++        anywhere else in FLEET. Default is False, so the output catalogs are
++        unchanged unless this is turned on.
+     wise_radius_arcsec : float, optional
+         The radius in arcseconds to match catalog sources to unWISE. Default is 2.0.
+ 
