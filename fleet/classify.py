@@ -2,7 +2,9 @@ from .transient import get_transient_info, process_lightcurve
 from .model import fit_data
 from .catalog import (get_catalog, catalog_operations, overwrite_with_glade,
                       get_best_host, host_limit, query_wise, merge_wise,
-                      query_gaia, merge_gaia, write_catalog)
+                      query_gaia, merge_gaia, write_catalog,
+                      catalog_match_available, wise_catalog_columns,
+                      gaia_catalog_columns, clear_catalog_field_marker)
 from .plot import make_plot, calculate_observability, calc_absmag, quick_plot
 import pkg_resources
 import multiprocessing
@@ -718,7 +720,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf', rubin_dir='rubin',
             match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
             running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False,
-            use_wise=False, use_gaia=False, host_search_radius=5.0, wise_catalog='unwise'):
+            add_wise=False, add_gaia=False, small_wise=False, small_gaia=False,
+            host_search_radius=5.0, wise_catalog='unwise'):
     """
     Predicts the classification of an object based on its name, right ascension, and declination.
 
@@ -795,7 +798,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     search_radius : float, optional
         The search radius in arcminutes for finding host galaxies. Default is 1.0.
     reimport_catalog : bool, optional
-        Whether to reimport the galaxy catalog. Default is False.
+        Whether to regenerate the galaxy catalog. This also refreshes enabled
+        WISE and Gaia data. Default is False.
     catalog_dir : str, optional
         The directory to save the galaxy catalog. Default is 'catalogs'.
     save_catalog : bool, optional
@@ -874,16 +878,21 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         Whether to actually use the forced photometry when fitting and classifying.
         If False, any forced photometry is kept in the saved light curve files but
         removed before FLEET uses the light curve. Default is False.
-    use_wise : bool, optional
-        Whether to query WISE and append its photometry to the output catalog.
-        The WISE photometry is only saved, it is not used anywhere else in
-        FLEET. Default is False.
-    use_gaia : bool, optional
-        Whether to query Gaia and append its astrometry and photometry to the
-        output catalog. Default is False.
+    add_wise : bool, optional
+        Query WISE across the full optical-catalog field and match every row.
+        Default is False.
+    add_gaia : bool, optional
+        Query Gaia across the full optical-catalog field and match every row.
+        Default is False.
+    small_wise : bool, optional
+        Query WISE only around the selected best host and enrich that row.
+        Ignored when ``add_wise`` is True. Default is False.
+    small_gaia : bool, optional
+        Query Gaia only around the selected best host and enrich that row.
+        Ignored when ``add_gaia`` is True. Default is False.
     host_search_radius : float, optional
-        Cone radius in arcseconds for WISE and Gaia queries around the best
-        host. Default is 5.0.
+        Cone radius in arcseconds for ``small_wise`` and ``small_gaia``.
+        Default is 5.0.
     wise_catalog : {'allwise', 'unwise'}, optional
         WISE catalog to query. Default is ``unwise``.
 
@@ -992,7 +1001,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                        dec_deg=dec_deg, transient_source=transient_source, object_name=object_name, ztf_name=ztf_name,
                                        rubin_name=rubin_name, tns_name=tns_name, object_class=object_class, redshift=redshift, color_peak=color_peak,
                                        late_color=late_color, late_color10=late_color10, late_color20=late_color20, late_color40=late_color40,
-                                       late_color60=late_color60, first_to_peak_r=first_to_peak_r, first_to_peak_g=first_to_peak_g, peak_to_last_r=peak_to_last_r,
+                                       late_color60=late_color60, first_to_peak_r=first_to_peak_r,
+                                       first_to_peak_g=first_to_peak_g, peak_to_last_r=peak_to_last_r,
                                        peak_to_last_g=peak_to_last_g, bright_mjd=bright_mjd, first_mjd=first_mjd, brightest_mag=brightest_mag,
                                        green_brightest=green_brightest, red_brightest=red_brightest, chi2=chi2, save_params=save_params, classifier=classifier,
                                        plot_output=plot_output, do_observability=do_observability, classify=classify,
@@ -1018,7 +1028,9 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     ######################
     merged_catalog = get_catalog(object_name, ra_deg, dec_deg, search_radius=search_radius, reimport_catalog=reimport_catalog,
                                  catalog_dir=catalog_dir, save_catalog=save_catalog, use_old=use_old,
-                                 match_radius_arcsec=match_radius_arcsec)
+                                 match_radius_arcsec=match_radius_arcsec,
+                                 add_wise=add_wise, add_gaia=add_gaia,
+                                 wise_catalog=wise_catalog)
 
     data_catalog = catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=Pcc_filter,
                                       Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,
@@ -1038,9 +1050,18 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                                             pcc_pcc_threshold=pcc_pcc_threshold,
                                                             pcc_distance_threshold=pcc_distance_threshold)
 
+    # A full-field query already includes the best host, so it takes
+    # precedence if both modes were requested for the same service.
+    run_small_wise = small_wise and not add_wise
+    run_small_gaia = small_gaia and not add_gaia
+    if small_wise and add_wise:
+        print('Skipping small WISE query because add_wise is enabled.')
+    if small_gaia and add_gaia:
+        print('Skipping small Gaia query because add_gaia is enabled.')
+
     # Query WISE and Gaia only around the selected host, then append the
     # results to that one row in both the working and saved catalogs.
-    if use_wise or use_gaia:
+    if run_small_wise or run_small_gaia:
         valid_host = best_host is not None and 0 <= int(best_host) < len(data_catalog)
         if valid_host:
             host_query_ra = float(data_catalog['ra_matched'][best_host])
@@ -1050,45 +1071,73 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         if not valid_host:
             print('No best host; skipping requested host-catalog queries.')
 
-        suffixes = []
-        if use_wise:
-            catalog_wise = None
-            if valid_host:
-                catalog_wise = query_wise(
-                    host_query_ra, host_query_dec,
-                    search_radius=host_search_radius, catalog=wise_catalog
-                )
-            data_catalog = merge_wise(
-                data_catalog, catalog_wise,
-                host_index=best_host if valid_host else None,
-                match_radius_arcsec=match_radius_arcsec,
-                catalog=wise_catalog
+        updated_suffixes = []
+        if run_small_wise:
+            wise_catalog = wise_catalog.lower()
+            _, required_wise_columns, wise_value_columns = wise_catalog_columns(
+                wise_catalog
             )
-            suffixes.append('_wise')
-
-        if use_gaia:
-            catalog_gaia = None
-            if valid_host:
-                catalog_gaia = query_gaia(
-                    host_query_ra, host_query_dec,
-                    search_radius=host_search_radius
-                )
-            data_catalog = merge_gaia(
-                data_catalog, catalog_gaia,
-                host_index=best_host if valid_host else None,
-                match_radius_arcsec=match_radius_arcsec
+            query_wise_needed = reimport_catalog or not catalog_match_available(
+                data_catalog, required_wise_columns, wise_value_columns,
+                row_index=best_host if valid_host else None
             )
-            suffixes.append('_gaia')
 
-        for column_name in data_catalog.colnames:
-            if any(column_name.endswith(suffix) for suffix in suffixes):
-                merged_catalog[column_name] = data_catalog[column_name].copy()
+            if query_wise_needed:
+                catalog_wise = None
+                if valid_host:
+                    catalog_wise = query_wise(
+                        host_query_ra, host_query_dec,
+                        search_radius=host_search_radius,
+                        catalog=wise_catalog
+                    )
+                data_catalog = merge_wise(
+                    data_catalog, catalog_wise,
+                    host_index=best_host if valid_host else None,
+                    match_radius_arcsec=match_radius_arcsec,
+                    catalog=wise_catalog
+                )
+                clear_catalog_field_marker(data_catalog, 'wise')
+                clear_catalog_field_marker(merged_catalog, 'wise')
+                updated_suffixes.append('_wise')
+            else:
+                print('Using existing WISE catalog data.')
 
-        if save_catalog:
-            os.makedirs(catalog_dir, exist_ok=True)
-            catalog_path = os.path.join(catalog_dir, f'{object_name}.cat')
-            write_catalog(merged_catalog, catalog_path)
-            print(f'Saved enriched catalog to {catalog_path}')
+        if run_small_gaia:
+            required_gaia_columns, gaia_value_columns = gaia_catalog_columns()
+            query_gaia_needed = reimport_catalog or not catalog_match_available(
+                data_catalog, required_gaia_columns, gaia_value_columns,
+                row_index=best_host if valid_host else None
+            )
+
+            if query_gaia_needed:
+                catalog_gaia = None
+                if valid_host:
+                    catalog_gaia = query_gaia(
+                        host_query_ra, host_query_dec,
+                        search_radius=host_search_radius
+                    )
+                data_catalog = merge_gaia(
+                    data_catalog, catalog_gaia,
+                    host_index=best_host if valid_host else None,
+                    match_radius_arcsec=match_radius_arcsec
+                )
+                clear_catalog_field_marker(data_catalog, 'gaia')
+                clear_catalog_field_marker(merged_catalog, 'gaia')
+                updated_suffixes.append('_gaia')
+            else:
+                print('Using existing Gaia catalog data.')
+
+        if updated_suffixes:
+            for column_name in data_catalog.colnames:
+                if any(column_name.endswith(suffix)
+                       for suffix in updated_suffixes):
+                    merged_catalog[column_name] = data_catalog[column_name].copy()
+
+            if save_catalog:
+                os.makedirs(catalog_dir, exist_ok=True)
+                catalog_path = os.path.join(catalog_dir, f'{object_name}.cat')
+                write_catalog(merged_catalog, catalog_path)
+                print(f'Saved enriched catalog to {catalog_path}')
 
     # Get the nearest host galaxy
     closest = np.nanargmin(data_catalog['separation'])
