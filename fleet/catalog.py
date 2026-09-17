@@ -1398,7 +1398,7 @@ def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
         wise_catalog = wise_catalog.lower()
         _, required_columns, value_columns = wise_catalog_columns(wise_catalog)
         existing_wise = (
-            _catalog_meta_value(merged_catalog, 'wise_field_catalog') == wise_catalog and
+            _catalog_meta_value(merged_catalog, 'wise_catalog') == wise_catalog and
             catalog_match_available(
                 merged_catalog, required_columns, value_columns
             )
@@ -1414,7 +1414,7 @@ def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
                 catalog=wise_catalog, match_all=True
             )
             _set_catalog_meta_value(
-                merged_catalog, 'wise_field_catalog', wise_catalog
+                merged_catalog, 'wise_catalog', wise_catalog
             )
             updated = True
         else:
@@ -1423,7 +1423,7 @@ def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
     if add_gaia:
         required_columns, value_columns = gaia_catalog_columns()
         existing_gaia = (
-            _catalog_meta_value(merged_catalog, 'gaia_field_catalog') == 'gaiadr3' and
+            _catalog_meta_value(merged_catalog, 'gaia_catalog') == 'gaiadr3' and
             catalog_match_available(
                 merged_catalog, required_columns, value_columns
             )
@@ -1438,7 +1438,7 @@ def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
                 match_radius_arcsec=match_radius_arcsec, match_all=True
             )
             _set_catalog_meta_value(
-                merged_catalog, 'gaia_field_catalog', 'gaiadr3'
+                merged_catalog, 'gaia_catalog', 'gaiadr3'
             )
             updated = True
         else:
