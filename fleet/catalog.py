@@ -22,6 +22,8 @@ except KeyError:
 # Central wavelengths for SDSS and 3PI filters
 sdss_refs = {'u': 3608.04, 'g': 4671.78, 'r': 6141.12, 'i': 7457.89, 'z': 8922.78}
 psst_refs = {'g': 4810.16, 'r': 6155.47, 'i': 7503.03, 'z': 8668.36, 'y': 9613.60}
+wise_refs = {'W1': 34000.0, 'W2': 46000.0, 'W3': 120000.0, 'W4': 220000.0}
+gaia_refs = {'BP': 5109.7, 'G': 6217.9, 'RP': 7769.1}
 
 # Survey limits for star/galaxy separation
 survey_limits = {'gPSFMag_3pi': 23.64,
@@ -37,6 +39,9 @@ survey_limits = {'gPSFMag_3pi': 23.64,
 
 # Vega to AB offsets for WISE, AB = Vega + offset
 wise_AB_offsets = {'W1': 2.699, 'W2': 3.339, 'W3': 5.174, 'W4': 6.620}
+
+# Gaia (E)DR3 Vega to AB offsets, calculated from the published zero points
+gaia_AB_offsets = {'BP': 0.0154133392, 'G': 0.1136777774, 'RP': 0.3560882381}
 
 gaia_columns = (
     'ra', 'ra_error', 'dec', 'dec_error',
@@ -73,7 +78,9 @@ def wise_catalog_columns(catalog='unwise'):
         raise ValueError("catalog must be 'allwise' or 'unwise'")
 
     bands = band_sets[catalog]
-    required_columns = ['objid_wise', 'separation_wise']
+    required_columns = [
+        'objid_wise', 'ra_wise', 'dec_wise', 'separation_wise'
+    ]
     for band in bands:
         required_columns.extend([
             f'{band}_AB_wise', f'{band}_AB_err_wise',
@@ -1015,6 +1022,10 @@ def merge_wise(merged_catalog, catalog_wise, host_index=None,
         merged_catalog[f'{band}_AB_err_wise'].unit = u.mag
         merged_catalog[f'{band}_limit_wise'] = np.full(n_rows, 'False', dtype='U5')
     merged_catalog['objid_wise'] = np.full(n_rows, '--', dtype='U32')
+    merged_catalog['ra_wise'] = np.full(n_rows, np.nan)
+    merged_catalog['ra_wise'].unit = u.deg
+    merged_catalog['dec_wise'] = np.full(n_rows, np.nan)
+    merged_catalog['dec_wise'].unit = u.deg
     merged_catalog['separation_wise'] = np.full(n_rows, np.nan)
     merged_catalog['separation_wise'].unit = u.arcsec
 
@@ -1039,6 +1050,12 @@ def merge_wise(merged_catalog, catalog_wise, host_index=None,
 
     merged_catalog['objid_wise'][catalog_indices] = _wise_strings(
         catalog_wise, 'objid_wise'
+    )[match_indices]
+    merged_catalog['ra_wise'][catalog_indices] = _catalog_floats(
+        catalog_wise, 'ra_wise'
+    )[match_indices]
+    merged_catalog['dec_wise'][catalog_indices] = _catalog_floats(
+        catalog_wise, 'dec_wise'
     )[match_indices]
     merged_catalog['separation_wise'][catalog_indices] = separations
     return merged_catalog
