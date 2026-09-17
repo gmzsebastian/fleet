@@ -677,13 +677,14 @@ def query_gaia(ra_deg, dec_deg, search_radius=5.0, DR=3, gaia_limit=10,
     """Query Gaia within ``search_radius`` arcseconds of a position."""
     coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
 
+    print(f"Querying Gaia DR{DR}...")
     try:
         if not use_vizier:
             Gaia.ROW_LIMIT = gaia_limit
             Gaia.MAIN_GAIA_TABLE = f'gaiadr{DR}.gaia_source'
-            result = Gaia.cone_search_async(
-                coord, radius=search_radius * u.arcsec
-            ).get_results()
+            job = Gaia.cone_search(coord, radius=search_radius * u.arcsec,
+                                   columns=gaia_columns)
+            result = job.get_results()
             catalog_gaia = result[list(gaia_columns)]
         else:
             if DR == 3:
@@ -817,7 +818,7 @@ def query_wise(ra_deg, dec_deg, search_radius=5.0, catalog='unwise', snr_limit=2
     coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
     vizier = Vizier(catalog=config['id'], columns=config['columns'], row_limit=1000)
 
-    print(f"Querying {catalog} ...")
+    print(f"\nQuerying {catalog} ...")
     try:
         result = vizier.query_region(
             coord,
