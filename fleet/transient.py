@@ -1874,26 +1874,29 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
         if col not in local_data.colnames:
             local_data[col] = table.Column([np.nan] * len(local_data), name=col, dtype='float64')
 
-    # Make sure the order of ZTF data is in the order of colnames (MJD, Raw, MagErr, Telescope... etc)
-    ztf_data = ztf_data[colnames]
-
-    # Copy the types from ztf_data into the other two tables
-    if len(ztf_data) > 0:
-        rubin_data = table.Table(rubin_data, names=ztf_data.colnames, dtype=ztf_data.dtype)
-        osc_data = table.Table(osc_data, names=ztf_data.colnames, dtype=ztf_data.dtype)
-        local_data = table.Table(local_data, names=ztf_data.colnames, dtype=ztf_data.dtype)
-
-    # Combine all data into one table
-    input_table = table.vstack([ztf_data, rubin_data, osc_data, local_data])
+    # Normalize each input independently, then let vstack promote string
+    # columns to the widest value present. Casting everything to the ZTF dtype
+    # truncated longer labels such as Telescope='Rubin' and
+    # Source='Alerce-forced'. Normalizing first also gives empty tables the
+    # correct numeric/string schema.
+    lightcurve_dtype = [
+        'float64', 'float64', 'float64', 'str', 'str', 'str', 'str',
+        'float64', 'float64', 'str'
+    ]
+    lightcurve_tables = [
+        table.Table(data[colnames], names=colnames, dtype=lightcurve_dtype)
+        for data in (ztf_data, rubin_data, osc_data, local_data)
+    ]
+    input_table = table.vstack(lightcurve_tables)
 
     # If there is no data, return an empty table
     if len(input_table) == 0:
         print("No data found for the specified object.")
         return input_table
 
-    # Assigning types: float, float, float, str, str, str, str, float, float, str
+    # Retain the normalized schema after stacking.
     input_table = table.Table(input_table[colnames], names=colnames,
-                              dtype=['float64', 'float64', 'float64', 'str', 'str', 'str', 'str', 'float64', 'float64', 'str'])
+                              dtype=lightcurve_dtype)
 
     # Make sure all values in UL are either True or False, if they are in this list set it to True
     limit_list = [True, -1.0, 'True', '-1', '-1.0', '-1.', b'True', b'-1', b'-1.0', b'-1.', 'T']

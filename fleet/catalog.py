@@ -10,7 +10,6 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord, match_coordinates_sky
 from astroquery.sdss import SDSS
 from astroquery.gaia import Gaia
-from astroquery.ipac.irsa import Irsa
 import time
 from astropy import table
 import pkg_resources
@@ -36,9 +35,31 @@ survey_limits = {'gPSFMag_3pi': 23.64,
                  'psfMag_i_sdss': 22.04,
                  'psfMag_z_sdss': 21.58}
 
-# Vega to AB offsets for unWISE, AB = Vega + offset
-# Set these to 0.0 to store Vega magnitudes instead
-unwise_AB_offsets = {'W1': 2.699, 'W2': 3.339}
+# Vega to AB offsets for WISE, AB = Vega + offset
+wise_AB_offsets = {'W1': 2.699, 'W2': 3.339, 'W3': 5.174, 'W4': 6.620}
+
+gaia_columns = (
+    'ra', 'ra_error', 'dec', 'dec_error',
+    'parallax', 'parallax_error', 'pm',
+    'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
+    'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag'
+)
+gaia_units = {
+    'ra': u.deg,
+    'ra_error': u.mas,
+    'dec': u.deg,
+    'dec_error': u.mas,
+    'parallax': u.mas,
+    'parallax_error': u.mas,
+    'pm': u.mas / u.yr,
+    'pmra': u.mas / u.yr,
+    'pmra_error': u.mas / u.yr,
+    'pmdec': u.mas / u.yr,
+    'pmdec_error': u.mas / u.yr,
+    'phot_g_mean_mag': u.mag,
+    'phot_bp_mean_mag': u.mag,
+    'phot_rp_mean_mag': u.mag,
+}
 
 # Default limits for host galaxy mags
 host_limit = {'u': 23.42,
@@ -55,6 +76,20 @@ cached_catalog = table.Table.read(classification_catalog_filename, format='ascii
 # Import GLADE data to classify objects as star/galaxy
 glade_filename = pkg_resources.resource_filename(__name__, 'GLADE_short.txt')
 cached_glade = table.Table.read(glade_filename, format='ascii.fast_csv', delimiter=',', guess=False)
+
+
+def write_catalog(catalog, catalog_path):
+    """Write a catalog without synthetic table-name comments."""
+    output = catalog.copy()
+    comments = output.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+    comments = [comment for comment in comments if str(comment).strip() != 'Table1']
+    if comments:
+        output.meta['comments'] = comments
+    else:
+        output.meta.pop('comments', None)
+    output.write(catalog_path, format='ascii', overwrite=True)
 
 
 def clean_table(catalog, replace_value=np.nan):
@@ -637,298 +672,347 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
     return output
 
 
-def query_gaia(ra_deg, dec_deg, search_radius=1.0, DR=3, gaia_limit=10, use_vizier=False):
-    """
-    Query Gaia for objects within a search radius of given coordinates.
+def query_gaia(ra_deg, dec_deg, search_radius=5.0, DR=3, gaia_limit=10,
+               use_vizier=False):
+    """Query Gaia within ``search_radius`` arcseconds of a position."""
+    coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
 
-    Parameters
-    -----------
-    ra_deg : float
-        Right Ascension in degrees
-    dec_deg : float
-        Declination in degrees
-    search_radius : float
-        Search radius in arcsec
-    DR : int, default 3
-        Gaia Data Release
-    gaia_limit : int, default 10
-        Maximum number of sources to return
-    use_vizier : bool, default False
-        If True, query Gaia via VizieR instead of Gaia archive
-
-    Returns
-    --------
-    catalog_gaia : astropy.table.Table or None
-        Table containing Gaia data
-    """
-
-    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.degree, u.degree), frame='icrs')
-
-    if not use_vizier:
-        # ---- Original behavior (Gaia archive) ----
-        Gaia.ROW_LIMIT = gaia_limit
-        Gaia.MAIN_GAIA_TABLE = f"gaiadr{DR}.gaia_source"
-
-        gaia_query = Gaia.cone_search_async(coord, radius=u.Quantity(search_radius, u.arcsec))
-        gaia_table = gaia_query.get_results()
-
-        catalog_gaia = gaia_table[
-            'ra', 'ra_error', 'dec', 'dec_error',
-            'parallax', 'parallax_error', 'pm',
-            'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
-            'phot_g_mean_mag', 'phot_bp_mean_mag',
-            'phot_rp_mean_mag'
-        ]
-
-        return catalog_gaia
-
-    else:
-        # ---- VizieR behavior ----
-        if DR == 3:
-            catalog_id = "I/355/gaiadr3"
-        elif DR == 2:
-            catalog_id = "I/345/gaia2"
+    try:
+        if not use_vizier:
+            Gaia.ROW_LIMIT = gaia_limit
+            Gaia.MAIN_GAIA_TABLE = f'gaiadr{DR}.gaia_source'
+            result = Gaia.cone_search_async(
+                coord, radius=search_radius * u.arcsec
+            ).get_results()
+            catalog_gaia = result[list(gaia_columns)]
         else:
-            raise ValueError("VizieR Gaia only supports DR2 or DR3")
+            if DR == 3:
+                catalog_id = 'I/355/gaiadr3'
+            elif DR == 2:
+                catalog_id = 'I/345/gaia2'
+            else:
+                raise ValueError('VizieR Gaia only supports DR2 or DR3')
 
-        vizier = Vizier(
-            catalog=catalog_id,
-            columns=[
-                'RA_ICRS', 'e_RA_ICRS',
-                'DE_ICRS', 'e_DE_ICRS',
-                'Plx', 'e_Plx',
-                'pmRA', 'e_pmRA',
-                'pmDE', 'e_pmDE',
-                'Gmag', 'BPmag', 'RPmag'
-            ],
-            row_limit=gaia_limit
-        )
+            vizier = Vizier(
+                catalog=catalog_id,
+                columns=[
+                    'RA_ICRS', 'e_RA_ICRS', 'DE_ICRS', 'e_DE_ICRS',
+                    'Plx', 'e_Plx', 'pmRA', 'e_pmRA', 'pmDE', 'e_pmDE',
+                    'Gmag', 'BPmag', 'RPmag'
+                ],
+                row_limit=gaia_limit
+            )
+            result = vizier.query_region(
+                coord, radius=search_radius * u.arcsec, catalog=catalog_id
+            )
+            if not result:
+                return _empty_gaia_catalog()
 
-        result = vizier.query_region(
-            coord,
-            radius=u.Quantity(search_radius, u.arcsec),
-            catalog=catalog_id
-        )
+            catalog_gaia = result[0]
+            catalog_gaia.rename_columns(
+                ['RA_ICRS', 'e_RA_ICRS', 'DE_ICRS', 'e_DE_ICRS',
+                 'Plx', 'e_Plx', 'pmRA', 'e_pmRA', 'pmDE', 'e_pmDE',
+                 'Gmag', 'BPmag', 'RPmag'],
+                ['ra', 'ra_error', 'dec', 'dec_error',
+                 'parallax', 'parallax_error',
+                 'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
+                 'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag']
+            )
+            catalog_gaia['pm'] = np.sqrt(
+                catalog_gaia['pmra'] ** 2 + catalog_gaia['pmdec'] ** 2
+            )
+            catalog_gaia = catalog_gaia[list(gaia_columns)]
+    except ValueError:
+        raise
+    except Exception as error:
+        print(f'Error querying Gaia: {error}')
+        return _empty_gaia_catalog()
 
-        if len(result) == 0:
-            return None
+    return catalog_gaia
 
-        catalog_gaia = result[0]
 
-        # Rename columns to match Gaia archive naming as closely as possible
-        catalog_gaia.rename_columns(
-            ['RA_ICRS', 'e_RA_ICRS', 'DE_ICRS', 'e_DE_ICRS',
-             'Plx', 'e_Plx', 'pmRA', 'e_pmRA', 'pmDE', 'e_pmDE',
-             'Gmag', 'BPmag', 'RPmag'],
-            ['ra', 'ra_error', 'dec', 'dec_error',
-             'parallax', 'parallax_error',
-             'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
-             'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag']
-        )
+def merge_gaia(merged_catalog, catalog_gaia, host_index,
+               match_radius_arcsec=1.5):
+    """Attach the nearest Gaia source to one best-host row."""
+    for column_name in gaia_columns:
+        output_name = f'{column_name}_gaia'
+        merged_catalog[output_name] = np.full(len(merged_catalog), np.nan)
+        unit = gaia_units[column_name]
+        if catalog_gaia is not None and column_name in catalog_gaia.colnames:
+            unit = catalog_gaia[column_name].unit or unit
+        merged_catalog[output_name].unit = unit
 
-        # Add total proper motion column (to match Gaia archive output)
-        if 'pmra' in catalog_gaia.colnames and 'pmdec' in catalog_gaia.colnames:
-            catalog_gaia['pm'] = (catalog_gaia['pmra']**2 + catalog_gaia['pmdec']**2)**0.5
+    merged_catalog['separation_gaia'] = np.full(len(merged_catalog), np.nan)
+    merged_catalog['separation_gaia'].unit = u.arcsec
 
-        return catalog_gaia
+    match_index, separation = _nearest_host_match(
+        merged_catalog, catalog_gaia, host_index,
+        ra_column='ra', dec_column='dec',
+        match_radius_arcsec=match_radius_arcsec
+    )
+    if match_index is None:
+        return merged_catalog
 
-def query_wise(ra_deg, dec_deg, search_radius=1.0, data_table="unwise_2019"):
-    """
-    Query the unWISE catalog for objects within a search radius of given
-    coordinates. unWISE is deeper than AllWISE and only covers W1 and W2.
-    The table is band merged, so band 1 (W1) and band 2 (W2) are stored in
-    columns ending in '_1' and '_2', and the photometry is a flux in Vega
-    nanomaggies rather than a magnitude.
+    for column_name in gaia_columns:
+        value = _catalog_floats(catalog_gaia, column_name)[match_index]
+        merged_catalog[f'{column_name}_gaia'][host_index] = value
+    merged_catalog['separation_gaia'][host_index] = separation
+    return merged_catalog
+
+
+def _empty_gaia_catalog():
+    """Return an empty Gaia table with the standard query columns."""
+    catalog_gaia = table.Table()
+    for column_name in gaia_columns:
+        catalog_gaia[column_name] = np.array([], dtype=float)
+        catalog_gaia[column_name].unit = gaia_units[column_name]
+    return catalog_gaia
+
+
+def query_wise(ra_deg, dec_deg, search_radius=5.0, catalog='unwise', snr_limit=2.0):
+    """Query a WISE catalog through VizieR and return AB photometry.
 
     Parameters
     ----------
-    ra_deg : float
-        Right Ascension in degrees
-    dec_deg : float
-        Declination in degrees
+    ra_deg, dec_deg : float
+        Query position in degrees.
     search_radius : float
-        Search radius in arcmin
-    data_table : str
-        Name of the unWISE data table to query
+        Search radius in arcseconds.
+    catalog : {'allwise', 'unwise'}
+        WISE catalog to query. ``allwise`` uses II/328/allwise and returns
+        W1--W4. ``unwise`` uses II/363/unwise and returns W1 and W2.
+    snr_limit : float
+        unWISE measurements below this signal-to-noise ratio are returned as
+        upper limits. This parameter is not used for AllWISE, whose catalog
+        already identifies upper limits.
 
     Returns
     -------
-    catalog_wise : astropy.table.Table or None
-        Table containing unWISE data, with '_wise' appended to
-        every column name. None if the query failed.
+    astropy.table.Table
+        A normalized WISE table with coordinates, source ID, AB magnitudes,
+        magnitude errors, and upper-limit flags.
     """
+    catalog = catalog.lower()
+    catalog_config = {
+        'allwise': {
+            'id': 'II/328/allwise',
+            'bands': ('W1', 'W2', 'W3', 'W4'),
+            'columns': ['AllWISE', 'RAJ2000', 'DEJ2000',
+                        'W1mag', 'e_W1mag', 'W2mag', 'e_W2mag',
+                        'W3mag', 'e_W3mag', 'W4mag', 'e_W4mag', 'qph'],
+        },
+        'unwise': {
+            'id': 'II/363/unwise',
+            'bands': ('W1', 'W2'),
+            'columns': ['objID', 'RAJ2000', 'DEJ2000',
+                        'FW1', 'e_FW1', 'FW2', 'e_FW2', 'Prim'],
+        },
+    }
+    if catalog not in catalog_config:
+        choices = ', '.join(catalog_config)
+        raise ValueError(f"catalog must be one of: {choices}")
 
-    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.degree, u.degree), frame='icrs')
+    config = catalog_config[catalog]
+    catalog_wise = _empty_wise_catalog(config['bands'], catalog)
+    coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
+    vizier = Vizier(catalog=config['id'], columns=config['columns'], row_limit=1000)
 
+    print(f"Querying {catalog} ...")
     try:
-        print('Querying unWISE ...')
-        # Every column is requested instead of a list, because some unWISE
-        # column names ('primary') are reserved SQL words and make the
-        # generated ADQL invalid. Only the columns used below are read.
-        catalog_wise = Irsa.query_region(
+        result = vizier.query_region(
             coord,
-            catalog=data_table,
-            spatial="Cone",
-            radius=u.Quantity(search_radius, u.arcmin),
-            columns="*"
+            radius=search_radius * u.arcsec,
+            catalog=config['id']
         )
-    except Exception as e:
-        print(f"Error querying unWISE: {str(e)}")
-        return None
+    except Exception as error:
+        print(f"Error querying {catalog}: {error}")
+        return catalog_wise
 
-    if catalog_wise is None or len(catalog_wise) == 0:
+    if not result:
         print('Found 0 objects\n')
-        return None
+        return catalog_wise
 
-    # Sources land in more than one coadd, only keep the primary entry
-    if 'primary' in catalog_wise.colnames:
-        is_primary = _wise_floats(catalog_wise, 'primary') == 1
-        if np.any(is_primary):
-            catalog_wise = catalog_wise[is_primary]
+    raw_catalog = result[0]
+    if catalog == 'unwise' and 'Prim' in raw_catalog.colnames:
+        raw_catalog = raw_catalog[_catalog_floats(raw_catalog, 'Prim') == 1]
 
-    # Add '_wise' suffix to all column names
-    for col in catalog_wise.colnames:
-        catalog_wise.rename_column(col, f"{col}_wise")
+    catalog_wise = _empty_wise_catalog(config['bands'], catalog, len(raw_catalog))
+    catalog_wise['objid_wise'][:] = _wise_strings(
+        raw_catalog, 'AllWISE' if catalog == 'allwise' else 'objID'
+    )
+    catalog_wise['ra_wise'][:] = _catalog_floats(raw_catalog, 'RAJ2000')
+    catalog_wise['dec_wise'][:] = _catalog_floats(raw_catalog, 'DEJ2000')
+
+    if catalog == 'allwise':
+        quality = _wise_strings(raw_catalog, 'qph')
+        for index, band in enumerate(config['bands']):
+            magnitude = _catalog_floats(raw_catalog, f'{band}mag')
+            magnitude += wise_AB_offsets[band]
+            catalog_wise[f'{band}_AB_wise'][:] = magnitude
+            catalog_wise[f'{band}_AB_err_wise'][:] = _catalog_floats(
+                raw_catalog, f'e_{band}mag'
+            )
+            catalog_wise[f'{band}_limit_wise'][:] = np.array([
+                'True' if value != '--' and len(value) > index and
+                value[index] == 'U' else 'False'
+                for value in quality
+            ], dtype='U5')
+    else:
+        for band in config['bands']:
+            flux = _catalog_floats(raw_catalog, f'F{band}')
+            flux_error = _catalog_floats(raw_catalog, f'e_F{band}')
+            good_error = np.isfinite(flux_error) & (flux_error > 0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                signal_to_noise = flux / flux_error
+            detected = (np.isfinite(flux) & (flux > 0) & good_error &
+                        (signal_to_noise >= snr_limit))
+            upper_limit = good_error & ~detected
+
+            magnitude = np.full(len(raw_catalog), np.nan)
+            magnitude_error = np.full(len(raw_catalog), np.nan)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                magnitude[detected] = 22.5 - 2.5 * np.log10(flux[detected])
+                magnitude[upper_limit] = (
+                    22.5 - 2.5 * np.log10(snr_limit * flux_error[upper_limit])
+                )
+                magnitude_error[detected] = (
+                    2.5 / np.log(10.0) * flux_error[detected] / flux[detected]
+                )
+            magnitude += wise_AB_offsets[band]
+
+            catalog_wise[f'{band}_AB_wise'][:] = magnitude
+            catalog_wise[f'{band}_AB_err_wise'][:] = magnitude_error
+            catalog_wise[f'{band}_limit_wise'][:] = np.where(
+                upper_limit, 'True', 'False'
+            )
 
     print(f'Found {len(catalog_wise)} objects\n')
     return catalog_wise
 
 
-def merge_wise(merged_catalog, catalog_wise, match_radius_arcsec=2.0, snr_limit=2.0):
-    """
-    Add the unWISE photometry to an existing catalog by matching on
-    coordinates. Every row of merged_catalog gets W1 and W2 magnitudes and
-    errors. Rows with no unWISE match within match_radius_arcsec are filled
-    with NaN.
-
-    unWISE has no ph_qual or cc_flags columns, so a band is called an upper
-    limit when its signal to noise is below snr_limit. In that case the
-    reported magnitude is the snr_limit-sigma limiting magnitude and the
-    error is NaN, which is the same convention AllWISE uses for ph_qual 'U'.
-    The quality factor, blending fraction, and artifact flags are carried
-    through so they can be checked later.
-
-    Magnitudes are AB, converted from Vega with the offsets in
-    unwise_AB_offsets. Set those to 0.0 for Vega magnitudes instead.
-
-    Parameters
-    ----------
-    merged_catalog : astropy.table.Table
-        Catalog with ra_matched and dec_matched columns
-    catalog_wise : astropy.table.Table or None
-        Output of query_wise
-    match_radius_arcsec : float
-        Maximum separation in arcsec to call it a match
-    snr_limit : float
-        Signal to noise below which a band is called an upper limit
-
-    Returns
-    -------
-    merged_catalog : astropy.table.Table
-        The same catalog with the unWISE columns appended
-    """
-
-    # Band 1 is W1 and band 2 is W2 in the unWISE table
-    bands = {'W1': '1', 'W2': '2'}
+def merge_wise(merged_catalog, catalog_wise, host_index,
+               match_radius_arcsec=1.5, catalog='unwise'):
+    """Attach the nearest WISE source to one best-host row."""
     n_rows = len(merged_catalog)
+    if catalog_wise is None:
+        bands = ('W1', 'W2', 'W3', 'W4') if catalog == 'allwise' else ('W1', 'W2')
+    else:
+        bands = tuple(
+            band for band in wise_AB_offsets
+            if f'{band}_AB_wise' in catalog_wise.colnames
+        )
 
-    # Empty columns, used if there is no unWISE data at all
     for band in bands:
         merged_catalog[f'{band}_AB_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_AB_wise'].unit = u.mag
         merged_catalog[f'{band}_AB_err_wise'] = np.full(n_rows, np.nan)
-        merged_catalog[f'{band}_limit_wise'] = np.array(['False'] * n_rows, dtype='U5')
-        merged_catalog[f'{band}_qf_wise'] = np.full(n_rows, np.nan)
-        merged_catalog[f'{band}_fracflux_wise'] = np.full(n_rows, np.nan)
-        merged_catalog[f'{band}_flags_wise'] = np.full(n_rows, np.nan)
-    # This needs enough width for the real values, otherwise it gets truncated
-    merged_catalog['unwise_objid_wise'] = np.array(['--'] * n_rows, dtype='U32')
+        merged_catalog[f'{band}_AB_err_wise'].unit = u.mag
+        merged_catalog[f'{band}_limit_wise'] = np.full(n_rows, 'False', dtype='U5')
+    merged_catalog['objid_wise'] = np.full(n_rows, '--', dtype='U32')
     merged_catalog['separation_wise'] = np.full(n_rows, np.nan)
+    merged_catalog['separation_wise'].unit = u.arcsec
 
-    if catalog_wise is None or len(catalog_wise) == 0 or n_rows == 0:
-        print('No unWISE data, the W1 and W2 columns will be empty.\n')
+    match_index, separation = _nearest_host_match(
+        merged_catalog, catalog_wise, host_index,
+        ra_column='ra_wise', dec_column='dec_wise',
+        match_radius_arcsec=match_radius_arcsec
+    )
+    if match_index is None:
         return merged_catalog
 
-    # Match the two catalogs
-    coords_catalog = SkyCoord(ra=np.array(merged_catalog['ra_matched'], dtype=float) * u.deg,
-                              dec=np.array(merged_catalog['dec_matched'], dtype=float) * u.deg)
-    coords_wise = SkyCoord(ra=np.array(catalog_wise['ra_wise'], dtype=float) * u.deg,
-                           dec=np.array(catalog_wise['dec_wise'], dtype=float) * u.deg)
-    idx_wise, d2d, _ = match_coordinates_sky(coords_catalog, coords_wise)
-    matched = d2d < match_radius_arcsec * u.arcsec
+    for band in bands:
+        merged_catalog[f'{band}_AB_wise'][host_index] = _catalog_floats(
+            catalog_wise, f'{band}_AB_wise'
+        )[match_index]
+        merged_catalog[f'{band}_AB_err_wise'][host_index] = _catalog_floats(
+            catalog_wise, f'{band}_AB_err_wise'
+        )[match_index]
+        merged_catalog[f'{band}_limit_wise'][host_index] = _wise_strings(
+            catalog_wise, f'{band}_limit_wise'
+        )[match_index]
 
-    if not np.any(matched):
-        print('No unWISE matches found.\n')
-        return merged_catalog
-
-    # Pull out the matched unWISE rows
-    wise_matched = catalog_wise[idx_wise[matched]]
-
-    for band, suffix in bands.items():
-        flux = _wise_floats(wise_matched, f'flux_{suffix}_wise')
-        flux_err = _wise_floats(wise_matched, f'dflux_{suffix}_wise')
-
-        # Anything below the signal to noise cut becomes an upper limit
-        with np.errstate(divide='ignore', invalid='ignore'):
-            snr = flux / flux_err
-        good_error = np.isfinite(flux_err) & (flux_err > 0)
-        is_detection = np.isfinite(flux) & (flux > 0) & good_error & (snr >= snr_limit)
-        is_limit = good_error & ~is_detection
-
-        # Vega nanomaggies to magnitudes, then to AB
-        mags = np.full(len(wise_matched), np.nan)
-        errs = np.full(len(wise_matched), np.nan)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            mags[is_detection] = 22.5 - 2.5 * np.log10(flux[is_detection])
-            errs[is_detection] = (2.5 / np.log(10.0)) * flux_err[is_detection] / flux[is_detection]
-            # For a non-detection report the limiting magnitude instead
-            mags[is_limit] = 22.5 - 2.5 * np.log10(snr_limit * flux_err[is_limit])
-        mags += unwise_AB_offsets[band]
-
-        merged_catalog[f'{band}_AB_wise'][matched] = mags
-        merged_catalog[f'{band}_AB_err_wise'][matched] = errs
-        merged_catalog[f'{band}_limit_wise'][matched] = np.where(is_limit, 'True', 'False')
-        merged_catalog[f'{band}_qf_wise'][matched] = _wise_floats(wise_matched, f'qf_{suffix}_wise')
-        merged_catalog[f'{band}_fracflux_wise'][matched] = _wise_floats(wise_matched, f'fracflux_{suffix}_wise')
-        merged_catalog[f'{band}_flags_wise'][matched] = _wise_floats(wise_matched, f'flags_unwise_{suffix}_wise')
-
-    merged_catalog['unwise_objid_wise'][matched] = _wise_strings(wise_matched, 'unwise_objid_wise')
-    merged_catalog['separation_wise'][matched] = d2d[matched].arcsec
-
-    print(f'Matched {int(np.sum(matched))} objects to unWISE\n')
+    merged_catalog['objid_wise'][host_index] = _wise_strings(
+        catalog_wise, 'objid_wise'
+    )[match_index]
+    merged_catalog['separation_wise'][host_index] = separation
     return merged_catalog
 
 
-def _wise_floats(catalog_wise, column_name):
-    """
-    Return a WISE column as floats, with NaN for anything missing.
-    The column is converted to float before the mask is applied, because
-    some unWISE columns are integers and NaN cannot be used to fill those.
-    """
-    if column_name not in catalog_wise.colnames:
-        return np.full(len(catalog_wise), np.nan)
+def _nearest_host_match(merged_catalog, source_catalog, host_index, ra_column,
+                        dec_column, match_radius_arcsec):
+    """Return the nearest source index and separation for one host row."""
+    if (host_index is None or source_catalog is None or
+            len(source_catalog) == 0 or len(merged_catalog) == 0):
+        return None, np.nan
 
-    column = catalog_wise[column_name]
-    values = np.array(column, dtype=float)
+    host_coord = SkyCoord(
+        float(merged_catalog['ra_matched'][host_index]) * u.deg,
+        float(merged_catalog['dec_matched'][host_index]) * u.deg
+    )
+    source_ra = _catalog_floats(source_catalog, ra_column)
+    source_dec = _catalog_floats(source_catalog, dec_column)
+    valid_sources = np.isfinite(source_ra) & np.isfinite(source_dec)
+    if not np.any(valid_sources):
+        return None, np.nan
+
+    source_indices = np.flatnonzero(valid_sources)
+    source_coords = SkyCoord(
+        source_ra[valid_sources] * u.deg,
+        source_dec[valid_sources] * u.deg
+    )
+    separations = host_coord.separation(source_coords).to_value(u.arcsec)
+    if not np.any(np.isfinite(separations)):
+        return None, np.nan
+
+    nearest = int(np.nanargmin(separations))
+    if separations[nearest] > match_radius_arcsec:
+        return None, np.nan
+    return int(source_indices[nearest]), separations[nearest]
+
+
+def _empty_wise_catalog(bands, catalog_name, n_rows=0):
+    """Create an empty normalized WISE table with the requested band schema."""
+    catalog_wise = table.Table()
+    catalog_wise.meta['wise_catalog'] = catalog_name
+    catalog_wise['objid_wise'] = np.full(n_rows, '--', dtype='U32')
+    catalog_wise['ra_wise'] = np.full(n_rows, np.nan)
+    catalog_wise['ra_wise'].unit = u.deg
+    catalog_wise['dec_wise'] = np.full(n_rows, np.nan)
+    catalog_wise['dec_wise'].unit = u.deg
+    for band in bands:
+        catalog_wise[f'{band}_AB_wise'] = np.full(n_rows, np.nan)
+        catalog_wise[f'{band}_AB_wise'].unit = u.mag
+        catalog_wise[f'{band}_AB_err_wise'] = np.full(n_rows, np.nan)
+        catalog_wise[f'{band}_AB_err_wise'].unit = u.mag
+        catalog_wise[f'{band}_limit_wise'] = np.full(n_rows, 'False', dtype='U5')
+    return catalog_wise
+
+
+def _catalog_floats(input_catalog, column_name):
+    """Return a catalog column as floats, with NaN for missing values."""
+    if column_name not in input_catalog.colnames:
+        return np.full(len(input_catalog), np.nan)
+
+    column = input_catalog[column_name]
+    values = np.asarray(column, dtype=float).copy()
     values[np.ma.getmaskarray(column)] = np.nan
     return values
 
 
 def _wise_strings(catalog_wise, column_name):
-    """Return a WISE column as strings, with '--' for anything missing."""
+    """Return a WISE column as strings, with '--' for missing values."""
     if column_name not in catalog_wise.colnames:
-        return np.array(['--'] * len(catalog_wise))
+        return np.full(len(catalog_wise), '--', dtype='U2')
 
     column = catalog_wise[column_name]
     mask = np.ma.getmaskarray(column)
-
     values = []
-    for value, is_masked in zip(np.array(column, dtype=object), mask):
+    for value, is_masked in zip(np.asarray(column, dtype=object), mask):
         if isinstance(value, bytes):
             value = value.decode()
         text = '' if is_masked else str(value).strip()
-        values.append(text if text else '--')
-
-    return np.array(values)
+        values.append(text or '--')
+    return np.asarray(values)
 
 
 def query_2mass(ra_deg, dec_deg, search_radius=1.0):
@@ -1167,8 +1251,8 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
 
 
 def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalog=False,
-                catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5,
-                use_wise=False, wise_radius_arcsec=2.0):
+                catalog_dir='catalogs', save_catalog=True, use_old=True,
+                match_radius_arcsec=1.5):
     """
     Function to query SDSS and PSST catalogs, combine them, clean them, and return the merged catalog.
     Also save the output catalog to the catalog directory.
@@ -1193,11 +1277,6 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
         If True, use the old version of the query that requires an API key
     match_radius_arcsec : float
         Match radius in arcseconds for merging catalogs
-    use_wise : bool
-        If True, also query unWISE and append the W1 and W2 photometry
-        to the output catalog. Default is False.
-    wise_radius_arcsec : float
-        Match radius in arcseconds between the catalog and unWISE
 
     Returns
     -------
@@ -1238,16 +1317,10 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
     # Sort the catalog by separation
     merged_catalog.sort('separation')
 
-    # Append the unWISE photometry
-    if use_wise:
-        catalog_wise = query_wise(ra_deg, dec_deg, search_radius=search_radius)
-        merged_catalog = merge_wise(merged_catalog, catalog_wise,
-                                    match_radius_arcsec=wise_radius_arcsec)
-
     # Save the merged catalog to the specified directory
     if save_catalog:
         os.makedirs(catalog_dir, exist_ok=True)
-        merged_catalog.write(catalog_path, format='ascii', overwrite=True)
+        write_catalog(merged_catalog, catalog_path)
         print(f"Saved merged catalog to {catalog_path}")
 
     return merged_catalog
@@ -1640,7 +1713,7 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
 
         # Save nature to input catalog
         merged_catalog['object_nature'] = nature
-        merged_catalog.write(f'catalogs/{object_name}.cat', format='ascii', overwrite=True)
+        write_catalog(merged_catalog, f'catalogs/{object_name}.cat')
 
     # Calculate separations
     if 'separation' not in data_catalog.colnames:

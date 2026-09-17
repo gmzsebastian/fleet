@@ -25,6 +25,7 @@ setup(name='fleet_pipe',
       install_requires=[
         'numpy',
         'astroquery',
+        'pyvo>=1.9',
         'dustmaps',
         'bs4',
         'ephem',
