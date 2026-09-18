@@ -1390,7 +1390,8 @@ def get_local_lightcurve(object_name, local_dir='photometry', read_local=True):
 def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, redshift_in=None,
                        acceptance_radius=3, save_ztf=True, save_rubin=True, download_ztf=True, download_rubin=True,
                        download_osc=False, read_local=True, query_tns=True, ztf_dir='ztf', rubin_dir='rubin',
-                       lc_dir='lightcurves', osc_dir='osc', local_dir='photometry', download_forced=False):
+                       lc_dir='lightcurves', osc_dir='osc', local_dir='photometry', download_forced=False,
+                       read_existing=False):
     '''
     Get the coordinates and name for a transient. Either the coordinates
     and/or the name must be specified. The function will search for missing
@@ -1443,6 +1444,10 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
         Download the ZTF and Rubin forced photometry from Alerce
         and append it to the light curve files with
         Source = 'Alerce-forced'?
+    read_existing : bool
+        Is the combined light curve going to be read from lc_dir? If it is,
+        and that file exists, ZTF and Rubin are not queried at all, because
+        their photometry would only be discarded.
 
     Returns
     -------
@@ -1503,6 +1508,13 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
             clean_object_name_in = clean_object_name_in[2:]
         if clean_object_name_in.startswith('SN'):
             clean_object_name_in = clean_object_name_in[2:]
+
+    # If the combined light curve is going to be read from disk, there is no
+    # reason to query ZTF or Rubin for photometry that would be discarded
+    if read_existing and clean_object_name_in is not None:
+        if os.path.exists(os.path.join(lc_dir, f'{clean_object_name_in}.txt')):
+            download_ztf = False
+            download_rubin = False
 
     if not download_ztf and clean_object_name_in is not None:
         ztf_local_files = [
@@ -1818,6 +1830,7 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
 
     # Read existing data if requested
     output_file = os.path.join(lc_dir, f'{object_name}.txt')
+
     # Check if the file exists
     if os.path.exists(output_file) and read_existing:
         print('\nReading existing light curve data ...')

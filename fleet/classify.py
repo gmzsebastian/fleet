@@ -759,7 +759,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     lc_dir : str, optional
         The directory to save the light curve data. Default is 'lightcurves'.
     read_existing : bool, optional
-        Whether to read existing light curve data instead of downloading. Default is False.
+        Whether to read existing light curve data instead of downloading. If the light curve
+        file already exists in lc_dir, ZTF and Rubin are not queried at all. Default is False.
     clean_ignore : bool, optional
         Whether to clean the light curve data by ignoring certain observations. Default is True.
     dust_map : str, optional
@@ -916,7 +917,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                            acceptance_radius=acceptance_radius, save_ztf=save_ztf, download_ztf=download_ztf,
                            download_osc=download_osc, save_rubin=save_rubin, download_rubin=download_rubin, read_local=read_local,
                            query_tns=query_tns, ztf_dir=ztf_dir, rubin_dir=rubin_dir, lc_dir=lc_dir, osc_dir=osc_dir, local_dir=local_dir,
-                           download_forced=download_forced)
+                           download_forced=download_forced, read_existing=read_existing)
     print('\nPredicting:', object_name)
 
     if save_params:
