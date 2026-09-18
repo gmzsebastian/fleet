@@ -2135,7 +2135,7 @@ def calculate_coincidence(separation, size, magnitude):
 
 def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter='i',
                        Pcc_filter_alternative='r', neighbors=20, recalculate_nature=False,
-                       dust_map='SFD', minimum_halflight=0.7):
+                       dust_map='SFD', minimum_halflight=0.7, catalog_dir='catalogs'):
     """
     For all entries in a catalog, calculate and correct for extinction, estimate the nature
     of the object (galaxy vs. star), calculate the separation between the transient ra and dec
@@ -2164,6 +2164,9 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
         Dust map to use for extinction calculation (default is 'SFD')
     minimum_halflight : float
         Default half light radius if none was found (default is 0.7)
+    catalog_dir : str
+        Directory where the catalog is saved, used when the nature of the
+        objects is recalculated (default is 'catalogs')
 
     Returns
     -------
@@ -2210,7 +2213,7 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
 
         # Save nature to input catalog
         merged_catalog['object_nature'] = nature
-        write_catalog(merged_catalog, f'catalogs/{object_name}.cat')
+        write_catalog(merged_catalog, os.path.join(catalog_dir, f'{object_name}.cat'))
 
     # Calculate separations
     if 'separation' not in data_catalog.colnames:
@@ -2441,10 +2444,28 @@ def get_best_host(data_catalog, star_separation=1.0, star_cut=0.1, best_index=No
         host_magnitude_g = data_catalog['host_magnitude_g'][best_host]
         host_magnitude_r = data_catalog['host_magnitude_r'][best_host]
         host_nature = data_catalog['object_nature'][best_host]
-        photoz = data_catalog['photoz'][best_host] if 'photoz' in data_catalog.colnames else None
-        photoz_err = data_catalog['photoz_err'][best_host] if 'photoz_err' in data_catalog.colnames else None
-        specz = data_catalog['specz'][best_host] if 'specz' in data_catalog.colnames else None
-        specz_err = data_catalog['specz_err'][best_host] if 'specz_err' in data_catalog.colnames else None
+
+        # The redshift columns from SDSS carry the survey suffix, e.g. photoz_sdss
+        def host_redshift(column_names):
+            """Return the first finite value found among these columns."""
+            for column_name in column_names:
+                if column_name not in data_catalog.colnames:
+                    continue
+                value = data_catalog[column_name][best_host]
+                if np.ma.is_masked(value):
+                    continue
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    return value
+            return None
+
+        photoz = host_redshift(['photoz', 'photoz_sdss'])
+        photoz_err = host_redshift(['photoz_err', 'photozErr_sdss'])
+        specz = host_redshift(['specz', 'specz_sdss'])
+        specz_err = host_redshift(['specz_err', 'speczErr_sdss'])
 
     return (host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g, host_magnitude_r,
             host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection)

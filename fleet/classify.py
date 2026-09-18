@@ -605,8 +605,8 @@ def create_info_table(parameters, output_table, data_catalog, **kwargs):
     # Calculate the number of sources in the catalog, and whether there is SDSS and PSST data
     if data_catalog:
         num_sources = len(data_catalog)
-        has_sdss = 'gPSFMag_3pi' in data_catalog.columns
-        has_psst = 'psfMag_g_sdss' in data_catalog.columns
+        has_sdss = 'psfMag_g_sdss' in data_catalog.columns
+        has_psst = 'gPSFMag_3pi' in data_catalog.columns
         info_table['num_sources'] = num_sources
         info_table['has_sdss'] = has_sdss
         info_table['has_psst'] = has_psst
@@ -1036,7 +1036,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     data_catalog = catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=Pcc_filter,
                                       Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,
                                       recalculate_nature=recalculate_nature, dust_map=dust_map,
-                                      minimum_halflight=minimum_halflight)
+                                      minimum_halflight=minimum_halflight, catalog_dir=catalog_dir)
 
     # Keep track of where the host came from, to save it in the catalog header
     input_best_index = best_index
