@@ -483,6 +483,12 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
     if ra_key not in catalog.colnames or dec_key not in catalog.colnames:
         raise ValueError(f"Coordinate columns {ra_key} and/or {dec_key} not found in catalog")
 
+    # Columns that must never be averaged, the mean of two object IDs is not a
+    # real object and the mean of two integer type codes is not a real type
+    identifier_columns = ('objID_3pi', 'objID_sdss', 'objInfoFlag_3pi',
+                          'nDetections_3pi', 'primaryDetection_3pi',
+                          'type_sdss', 'clean_sdss')
+
     # Create SkyCoord objects for all sources
     coords = SkyCoord(ra=catalog[ra_key], dec=catalog[dec_key], unit='degree')
 
@@ -507,9 +513,12 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
         if processed[i]:
             continue  # Skip already processed entries
 
-        # Find all entries within duplicate_distance of this one
+        # Find all entries within duplicate_distance of this one, skipping any
+        # that were already merged into an earlier group, so that no source is
+        # counted twice when duplicates are chained (A-B and B-C but not A-C)
         separations = coords[i].separation(coords)
         duplicate_indices = np.where(separations < duplicate_distance * u.arcsec)[0]
+        duplicate_indices = duplicate_indices[~processed[duplicate_indices]]
 
         # Mark all duplicates as processed
         processed[duplicate_indices] = True
@@ -522,6 +531,22 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
             # Initialize a row for the merged entry
             merged_row = []
             for col in catalog.colnames:
+                # Average right ascension through the offsets from the first
+                # source, so the average does not jump across RA = 0/360
+                if col == ra_key:
+                    reference = float(duplicates[col][0])
+                    offsets = (np.array(duplicates[col], dtype=float)
+                               - reference + 180) % 360 - 180
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", category=RuntimeWarning)
+                        merged_row.append((reference + np.nanmean(offsets)) % 360)
+                    continue
+                # Identifiers, flags and any non-float column take the value of
+                # a representative source instead of being averaged
+                if col in identifier_columns or not np.issubdtype(duplicates[col].dtype, np.floating):
+                    non_empty = [val for val in duplicates[col] if val]
+                    merged_row.append(non_empty[0] if non_empty else duplicates[col][0])
+                    continue
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -1504,11 +1529,15 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
                            dec=catalog_sdss['dec_sdss'],
                            unit='deg')
 
-    # Find matches between the two catalogs
+    # Find matches between the two catalogs, keeping only mutual nearest
+    # neighbours so that two PanSTARRS sources cannot both claim the same SDSS
+    # source and end up sharing its photometry
     idx_sdss, d2d, _ = match_coordinates_sky(coords_psst, coords_sdss)
+    idx_psst, _, _ = match_coordinates_sky(coords_sdss, coords_psst)
+    mutual = idx_psst[idx_sdss] == np.arange(len(coords_psst))
 
     # Create masks for matches within the radius
-    matches = d2d < match_radius_arcsec * u.arcsec
+    matches = (d2d < match_radius_arcsec * u.arcsec) & mutual
 
     # Create a table for matched sources
     matched_sources = table.Table()
@@ -1523,8 +1552,12 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
         psst_matched = catalog_psst[psst_indices]
         sdss_matched = catalog_sdss[sdss_indices]
 
-        # Calculate average coordinates
-        ra_matched = (psst_matched['raStack_3pi'] + sdss_matched['ra_sdss']) / 2.0
+        # Calculate average coordinates. Average the offset between the two
+        # positions rather than the two right ascensions, so that a matched
+        # pair straddling RA = 0/360 does not average to 180 degrees.
+        psst_ra = np.array(psst_matched['raStack_3pi'], dtype=float)
+        sdss_ra = np.array(sdss_matched['ra_sdss'], dtype=float)
+        ra_matched = (psst_ra + ((sdss_ra - psst_ra + 180) % 360 - 180) / 2.0) % 360
         dec_matched = (psst_matched['decStack_3pi'] + sdss_matched['dec_sdss']) / 2.0
 
         # Create the matched part of the merged catalog
@@ -1533,8 +1566,8 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
         matched_sources['dec_matched'] = dec_matched
 
         # Create masks for unmatched sources
-        unmatched_psst_mask = ~np.in1d(np.arange(len(catalog_psst)), psst_indices)
-        unmatched_sdss_mask = ~np.in1d(np.arange(len(catalog_sdss)), sdss_indices)
+        unmatched_psst_mask = ~np.isin(np.arange(len(catalog_psst)), psst_indices)
+        unmatched_sdss_mask = ~np.isin(np.arange(len(catalog_sdss)), sdss_indices)
 
         # Get unmatched sources
         psst_unmatched = catalog_psst[unmatched_psst_mask]
@@ -1855,8 +1888,8 @@ def calc_galaxyness(data_catalog, psf_key, kron_key, classification_catalog=None
         classification_catalog = cached_catalog
 
     # Get PSF and Kron magnitudes for the observed objects
-    target_psfs = np.array(data_catalog[psf_key])
-    target_krons = np.array(data_catalog[kron_key])
+    target_psfs = _catalog_floats(data_catalog, psf_key)
+    target_krons = _catalog_floats(data_catalog, kron_key)
 
     # Replace with nan for PSF mags dimmer than survey limit
     survey_limit = survey_limits[psf_key]
@@ -1966,8 +1999,7 @@ def default_radius(mag, a=196.0, b=0.257, c=-0.27, minimum_halflight=0.7):
     radius : float or array-like
         Half-light radius value in arcsec
     '''
-    radius = a * np.exp(-b * mag) + c
-    radius[radius < minimum_halflight] = minimum_halflight
+    radius = np.clip(a * np.exp(-b * mag) + c, minimum_halflight, None)
     return radius
 
 
@@ -1997,7 +2029,7 @@ def get_halflight(data_catalog, color, host_mag, minimum_halflight=0.7):
         # Get Sersic Index from 3PI
         band_name = f'{color}SerNu_3pi'
         if band_name in data_catalog.colnames:
-            sersic_n = np.copy(data_catalog[band_name])
+            sersic_n = _catalog_floats(data_catalog, band_name)
             # Assume a sersic index of 0.5 if there is none
             sersic_n[np.isnan(sersic_n)] = 0.5
         else:
@@ -2014,11 +2046,13 @@ def get_halflight(data_catalog, color, host_mag, minimum_halflight=0.7):
 
         # Normalize Kron radius to half light radius
         if f'{color}KronRad_3pi' in data_catalog.colnames:
-            halflight_radius = data_catalog[f'{color}KronRad_3pi'] / R_norm
+            halflight_radius = _catalog_floats(data_catalog, f'{color}KronRad_3pi') / R_norm
         else:
             halflight_radius = np.nan * np.ones(len(data_catalog))
     elif f'petroR50_{color}_sdss' in data_catalog.colnames:
-        halflight_radius = data_catalog[f'petroR50_{color}_sdss']
+        # A copy, so that filling the missing values below does not write
+        # straight back into the catalog column
+        halflight_radius = _catalog_floats(data_catalog, f'petroR50_{color}_sdss')
     else:
         halflight_radius = np.nan * np.ones(len(data_catalog))
 
@@ -2065,11 +2099,12 @@ def get_host_mag(data_catalog, band, type='psf', survey=None,
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 host_mag = np.nanmean([data_catalog[f'{band}PSFMag_3pi'], data_catalog[f'psfMag_{band}_sdss']], axis=0)
         elif (f'{band}PSFMag_3pi' in data_catalog.colnames and survey is None) or (survey == '3pi'):
-            # If only PSST exists
-            host_mag = data_catalog[f'{band}PSFMag_3pi']
+            # If only PSST exists. A copy, so that filling the missing values
+            # below does not write straight back into the catalog column
+            host_mag = _catalog_floats(data_catalog, f'{band}PSFMag_3pi')
         elif (f'psfMag_{band}_sdss' in data_catalog.colnames and survey is None) or (survey == 'sdss'):
             # If only SDSS exists
-            host_mag = data_catalog[f'psfMag_{band}_sdss']
+            host_mag = _catalog_floats(data_catalog, f'psfMag_{band}_sdss')
         else:
             # If neither exists, return NaN
             host_mag = np.nan * np.ones(len(data_catalog))
@@ -2081,20 +2116,27 @@ def get_host_mag(data_catalog, band, type='psf', survey=None,
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 host_mag = np.nanmean([data_catalog[f'{band}KronMag_3pi'], data_catalog[f'modelMag_{band}_sdss']], axis=0)
         elif (f'{band}KronMag_3pi' in data_catalog.colnames and survey is None) or (survey == '3pi'):
-            # If only PSST exists
-            host_mag = data_catalog[f'{band}KronMag_3pi']
+            # If only PSST exists. A copy, so that filling the missing values
+            # below does not write straight back into the catalog column
+            host_mag = _catalog_floats(data_catalog, f'{band}KronMag_3pi')
         elif (f'modelMag_{band}_sdss' in data_catalog.colnames and survey is None) or (survey == 'sdss'):
             # If only SDSS exists
-            host_mag = data_catalog[f'modelMag_{band}_sdss']
+            host_mag = _catalog_floats(data_catalog, f'modelMag_{band}_sdss')
         else:
             # If neither exists, return NaN
             host_mag = np.nan * np.ones(len(data_catalog))
-        # Replace the nan values with the PSF magnitude
+        # Replace the nan values with the PSF magnitude. Try each survey in
+        # turn and only fill what is still missing, because the PanSTARRS
+        # columns exist but are entirely nan for SDSS-only rows, which would
+        # otherwise stop the SDSS magnitude from ever being used.
         if impute_values:
-            if f'{band}PSFMag_3pi' in data_catalog.colnames:
-                host_mag[~np.isfinite(host_mag)] = data_catalog[f'{band}PSFMag_3pi'][~np.isfinite(host_mag)]
-            elif f'psfMag_{band}_sdss' in data_catalog.colnames:
-                host_mag[~np.isfinite(host_mag)] = data_catalog[f'psfMag_{band}_sdss'][~np.isfinite(host_mag)]
+            for psf_column in (f'{band}PSFMag_3pi', f'psfMag_{band}_sdss'):
+                if psf_column not in data_catalog.colnames:
+                    continue
+                missing = ~np.isfinite(host_mag)
+                if not np.any(missing):
+                    break
+                host_mag[missing] = _catalog_floats(data_catalog, psf_column)[missing]
     else:
         raise ValueError("Invalid type specified. Use 'psf' or 'kron'.")
 
@@ -2409,7 +2451,7 @@ def get_best_host(data_catalog, star_separation=1.0, star_cut=0.1, best_index=No
             best_separation = use_catalog['separation'][best_galaxy]
 
             # Use a step function for the Pcc association to remove very far outliers
-            if (best_separation > 8) & (best_pcc > pcc_pcc_threshold):
+            if (best_separation > pcc_distance_threshold) & (best_pcc > pcc_pcc_threshold):
                 close_galaxies = use_catalog[use_catalog['separation'] <= pcc_distance_threshold]
                 if len(close_galaxies) > 0:
                     # If there are close galaxies, pick the one with the lowest Pcc

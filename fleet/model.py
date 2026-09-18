@@ -726,7 +726,7 @@ def calc_chi2(data, model, n_parameters, sigma, limits):
 
     # Calculate the chi squared value
     chisq = np.nansum(((data-model)/sigma)**2.0)
-    nu = data.size-n_parameters-1.0
+    nu = data.size-n_parameters
 
     # Ensure we don't divide by zero or negative degrees of freedom
     if nu > 0:
@@ -900,7 +900,7 @@ def plot_trace(param_chain, param_values, param_values_log, min_val, max_val,
         plt.ylim(np.log10(min_val), np.log10(max_val))
     else:
         plt.ylim(min_val, max_val)
-    ax1.hist(np.ndarray.flatten(param_chain[:, -int(n_steps*(1-burn_in)):]), bins='auto',
+    ax1.hist(np.ndarray.flatten(param_chain[:, -max(1, int(n_steps*(1-burn_in))):]), bins='auto',
              orientation="horizontal", color='k', range=(min_val, max_val))
     ax1.axhline(Averageline[-1], color='b', lw=1.0, linestyle='-', alpha=0.75)
     ax1.axhline(param_values[0], color='r', lw=2.0, linestyle='--', alpha=0.75)
@@ -1176,7 +1176,9 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
     n_steps : int, default=1000
         Number of steps for the MCMC fitting
     n_cores : int, default=1
-        Number of CPU cores to use for parallel processing
+        Number of CPU cores to use for parallel processing. Not currently
+        used, emcee 3 removed the 'threads' argument and needs a 'pool'
+        instead, which cannot be created from inside a worker process.
     model : str, default='full'
         Model to use for fitting. Options are 'single', 'double', or 'full'.
     late_phase : float, default=40
@@ -1337,7 +1339,11 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
                     lc_width = np.random.uniform(-0.4, 0.0, n_walkers)
                     lc_decline = np.random.uniform(0.01, 1.0, n_walkers)
                     phase_offset = np.random.uniform(-20, 10, n_walkers)
-                    mag_offset = np.random.uniform(brightest_mag-0.3, brightest_mag+0.3, n_walkers)
+                    # Keep the draws inside the mag_offset prior, otherwise no
+                    # draw is ever valid and the loop below cannot finish
+                    use_brightest_mag = np.clip(brightest_mag, priors['mag_offset'][0],
+                                                priors['mag_offset'][1])
+                    mag_offset = np.random.uniform(use_brightest_mag-0.3, use_brightest_mag+0.3, n_walkers)
 
                     pos = np.array([lc_width, lc_decline, phase_offset, mag_offset]).T
                     return pos
@@ -1349,8 +1355,19 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
                 pos_in = create_prior()
                 pos_out = pos_in[0:1]
 
+                attempts = 0
                 while len(pos_out) < n_walkers:
                     pos = pos_in[[np.isfinite(lnprior_double(i)) for i in pos_in]]
+                    if len(pos) == 0:
+                        # No draw landed inside the priors, so appending would
+                        # never grow pos_out and the loop would run forever
+                        attempts += 1
+                        if attempts > 1000:
+                            print('Warning: could not draw walkers inside the priors, using the raw draws.')
+                            pos_out = np.append(pos_out, pos_in, axis=0)
+                            break
+                        pos_in = create_prior()
+                        continue
                     pos_out = np.append(pos_out, pos, axis=0)
 
                 # Crop to correct length
@@ -1379,14 +1396,14 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
                 # Setup the MCMC sampler
                 if model == 'double':
                     sampler_red = emcee.EnsembleSampler(n_walkers, n_dim, lnprob_double,
-                                                        args=(x_r, y_r, z_r, l_r), threads=n_cores)
+                                                        args=(x_r, y_r, z_r, l_r))
                     sampler_green = emcee.EnsembleSampler(n_walkers, n_dim, lnprob_double,
-                                                          args=(x_g, y_g, z_g, l_g), threads=n_cores)
+                                                          args=(x_g, y_g, z_g, l_g))
                 elif model == 'single':
                     sampler_red = emcee.EnsembleSampler(n_walkers, n_dim, lnprob_single,
-                                                        args=(x_r, y_r, z_r, l_r, default_decline_r), threads=n_cores)
+                                                        args=(x_r, y_r, z_r, l_r, default_decline_r))
                     sampler_green = emcee.EnsembleSampler(n_walkers, n_dim, lnprob_single,
-                                                          args=(x_g, y_g, z_g, l_g, default_decline_g), threads=n_cores)
+                                                          args=(x_g, y_g, z_g, l_g, default_decline_g))
 
                 # Run the MCMC with sigma clipping
                 print("\nRunning r-MCMC ...")
@@ -1402,8 +1419,11 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
                                                              emcee_progress=emcee_progress)
 
                 # Only consider the last quarter of the chain for parameter estimation
-                samples_r_crop = sampler_red.chain[:, -int(n_steps*(1-burn_in)):, :].reshape((-1, n_dim))
-                samples_g_crop = sampler_green.chain[:, -int(n_steps*(1-burn_in)):, :].reshape((-1, n_dim))
+                # At least one step, since chain[:, -0:, :] would silently
+                # keep the whole chain, burn-in included
+                n_keep = max(1, int(n_steps*(1-burn_in)))
+                samples_r_crop = sampler_red.chain[:, -n_keep:, :].reshape((-1, n_dim))
+                samples_g_crop = sampler_green.chain[:, -n_keep:, :].reshape((-1, n_dim))
 
                 # Get the log probabilities
                 log_prob_red = sampler_red.lnprobability[:, -1]
@@ -1590,7 +1610,8 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
                 lc_width = np.random.uniform(-0.4, 0.0, n_walkers)
                 lc_decline = np.random.uniform(0.01, 1.0, n_walkers)
                 phase_offset = np.random.uniform(-20, 10, n_walkers)
-                use_brightest_mag = np.max([priors['mag_offset'][0], brightest_mag])
+                use_brightest_mag = np.clip(brightest_mag, priors['mag_offset'][0],
+                                            priors['mag_offset'][1])
                 mag_offset = np.random.uniform(use_brightest_mag-0.3, use_brightest_mag+0.3, n_walkers)
                 initial_temp = np.random.uniform(3000.0, 7000.0, n_walkers)
                 cooling_rate = np.random.uniform(10, 1000.0, n_walkers)
@@ -1602,8 +1623,19 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
             # Create array of proper length
             pos_in = create_prior()
             pos_out = pos_in[0:1]
+            attempts = 0
             while len(pos_out) < n_walkers:
                 pos = pos_in[[np.isfinite(lnprior_full(i)) for i in pos_in]]
+                if len(pos) == 0:
+                    # No draw landed inside the priors, so appending would
+                    # never grow pos_out and the loop would run forever
+                    attempts += 1
+                    if attempts > 1000:
+                        print('Warning: could not draw walkers inside the priors, using the raw draws.')
+                        pos_out = np.append(pos_out, pos_in, axis=0)
+                        break
+                    pos_in = create_prior()
+                    continue
                 pos_out = np.append(pos_out, pos, axis=0)
 
             # Crop to correct length
@@ -1624,7 +1656,7 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
 
             # Setup the MCMC sampler
             sampler = emcee.EnsembleSampler(n_walkers, n_dim, lnprob_full,
-                                            args=(phases, wavelengths, obs_mags, err_mags, obs_limits), threads=n_cores)
+                                            args=(phases, wavelengths, obs_mags, err_mags, obs_limits))
 
             # Run the MCMC
             print("Running MCMC ...")
@@ -1634,7 +1666,10 @@ def fit_data(input_table, phase_min=-200, phase_max=75, n_walkers=50, n_steps=50
                                                    emcee_progress=emcee_progress)
 
             # Only consider the last quarter of the chain for parameter estimation
-            samples_crop = sampler.chain[:, -int(n_steps*(1-burn_in)):, :].reshape((-1, n_dim))
+            # At least one step, since chain[:, -0:, :] would silently keep
+            # the whole chain, burn-in included
+            n_keep = max(1, int(n_steps*(1-burn_in)))
+            samples_crop = sampler.chain[:, -n_keep:, :].reshape((-1, n_dim))
 
             # Get the log probabilities
             log_prob = sampler.lnprobability[:, -1]
