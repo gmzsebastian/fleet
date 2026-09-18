@@ -4,7 +4,8 @@ from .catalog import (get_catalog, catalog_operations, overwrite_with_glade,
                       get_best_host, host_limit, query_wise, merge_wise,
                       query_gaia, merge_gaia, write_catalog,
                       catalog_match_available, wise_catalog_columns,
-                      gaia_catalog_columns, clear_catalog_field_marker)
+                      gaia_catalog_columns, clear_catalog_field_marker,
+                      add_host_metadata)
 from .plot import make_plot, calculate_observability, calc_absmag, quick_plot
 import pkg_resources
 import multiprocessing
@@ -1037,11 +1038,23 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                       recalculate_nature=recalculate_nature, dust_map=dust_map,
                                       minimum_halflight=minimum_halflight)
 
+    # Keep track of where the host came from, to save it in the catalog header
+    input_best_index = best_index
+    glade_index = None
+
     # Overwrite with GLADE if specified
     if use_glade:
         best_index = overwrite_with_glade(ra_deg, dec_deg, object_name, data_catalog,
                                           max_separation_glade=max_separation_glade, dimmest_glade=dimmest_glade,
                                           max_pcc_glade=max_pcc_glade, max_distance_glade=max_distance_glade)
+        glade_index = best_index
+
+    if glade_index is not None:
+        best_host_source = 'glade'
+    elif input_best_index is not None and best_index is not None:
+        best_host_source = 'input'
+    else:
+        best_host_source = 'chance_coincidence'
 
     (host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude,
      host_magnitude_g, host_magnitude_r, host_nature, photoz, photoz_err, specz,
@@ -1183,6 +1196,25 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                    classify=classify, include_het=include_het, pupil_fraction=pupil_fraction, minimum_halflight=minimum_halflight,
                                    match_radius_arcsec=match_radius_arcsec, pcc_pcc_threshold=pcc_pcc_threshold,
                                    pcc_distance_threshold=pcc_distance_threshold, n_sigma_limit=n_sigma_limit)
+
+    #############################
+    # Save the catalog metadata #
+    #############################
+    # Record which row was selected as the host in the header of the catalog,
+    # so the choice can be traced from the saved file
+    if 'hostless' in info_table.colnames:
+        hostless = info_table['hostless'][0]
+    else:
+        hostless = None
+
+    add_host_metadata(merged_catalog, data_catalog, best_host=best_host, closest=closest,
+                      best_host_source=best_host_source, force_detection=force_detection,
+                      hostless=hostless)
+
+    if save_catalog:
+        catalog_path = os.path.join(catalog_dir, f'{object_name}.cat')
+        write_catalog(merged_catalog, catalog_path)
+        print(f'\nSaved catalog metadata to {catalog_path}')
 
     ##################
     # Classification #

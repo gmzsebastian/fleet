@@ -13,6 +13,13 @@ from astroquery.gaia import Gaia
 import time
 from astropy import table
 import pkg_resources
+from datetime import datetime, timezone
+from importlib.metadata import version as _package_version, PackageNotFoundError
+
+try:
+    fleet_version = _package_version('fleet_pipe')
+except PackageNotFoundError:  # pragma: no cover
+    fleet_version = 'unknown'
 
 try:
     fleet_data = os.environ['fleet_data']
@@ -154,7 +161,7 @@ def _set_catalog_meta_value(input_catalog, key, value):
     prefix = f'{key} ='
     comments = [comment for comment in comments
                 if not str(comment).startswith(prefix)]
-    comments.append(f'{key} = {value}')
+    comments.append(f'{key} = {_format_meta_value(value)}')
     input_catalog.meta['comments'] = comments
 
 
@@ -171,6 +178,170 @@ def clear_catalog_field_marker(input_catalog, service):
         input_catalog.meta['comments'] = comments
     else:
         input_catalog.meta.pop('comments', None)
+
+
+# Preferred order of the 'key = value' entries in the catalog header. Any key
+# that is not listed here is written after these, in alphabetical order.
+catalog_meta_order = [
+    # Provenance of the file itself
+    'fleet_version', 'catalog_date', 'object_name', 'ra_deg', 'dec_deg',
+    'search_radius_arcmin', 'match_radius_arcsec', 'extinction_corrected',
+    # Which catalogs were queried, how, and how many rows each contributed
+    'panstarrs_catalog', 'panstarrs_query', 'panstarrs_rows',
+    'sdss_catalog', 'sdss_query', 'sdss_rows',
+    'wise_catalog', 'wise_matches',
+    'gaia_catalog', 'gaia_matches',
+    # The host that FLEET ended up selecting
+    'best_host', 'best_host_source', 'best_host_forced', 'hostless',
+    'closest_host', 'closest_separation',
+]
+
+
+def _format_meta_value(value):
+    """
+    Format one value for a ``key = value`` entry of a catalog header. Missing
+    values of any kind are written as 'None', and whole numbers are written
+    without a decimal point.
+
+    Parameters
+    ----------
+    value : any
+        The value to format.
+
+    Returns
+    -------
+    str
+        The value as a single-line string.
+    """
+    if value is None:
+        return 'None'
+    if isinstance(value, bytes):
+        value = value.decode()
+    if np.ma.is_masked(value):
+        return 'None'
+    # Booleans have to be checked before integers, since bool is an int
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        if not np.isfinite(value):
+            return 'None'
+        # Whole numbers are written without decimals, so indices stay readable
+        if value.is_integer():
+            return str(int(value))
+        return f'{value:.8f}'.rstrip('0')
+
+    text = str(value).strip().replace('\n', ' ')
+    return text if text else 'None'
+
+
+def set_catalog_meta(input_catalog, metadata):
+    """
+    Set several ``key = value`` entries in the header of a catalog at once.
+
+    Parameters
+    ----------
+    input_catalog : astropy.table.Table
+        Catalog to modify in place.
+    metadata : dict
+        Mapping of header keys to values.
+
+    Returns
+    -------
+    input_catalog : astropy.table.Table
+        The same catalog, with the metadata attached.
+    """
+    for key, value in metadata.items():
+        _set_catalog_meta_value(input_catalog, key, value)
+    return input_catalog
+
+
+def get_catalog_meta(input_catalog):
+    """
+    Read every ``key = value`` entry of a catalog header into a dictionary.
+    This is the counterpart of ``set_catalog_meta``, and works on catalogs
+    that were just built as well as ones read back from a file.
+
+    Parameters
+    ----------
+    input_catalog : astropy.table.Table
+        Catalog with a metadata header.
+
+    Returns
+    -------
+    metadata : dict
+        Mapping of header keys to their (string) values.
+    """
+    comments = input_catalog.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+
+    metadata = {}
+    for comment in comments:
+        text = str(comment)
+        if '=' not in text:
+            continue
+        key, value = text.split('=', 1)
+        metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def _catalog_source_label(source_catalog, key, default='none'):
+    """Return a provenance label that was stored by a catalog query."""
+    if source_catalog is None:
+        return default
+    return source_catalog.meta.get(key, 'unknown')
+
+
+def add_host_metadata(input_catalog, data_catalog=None, best_host=None, closest=None,
+                      best_host_source=None, force_detection=None, hostless=None):
+    """
+    Record which row of the catalog was selected as the host galaxy in the
+    header of a catalog, so the choice can be recovered from the saved file.
+
+    Parameters
+    ----------
+    input_catalog : astropy.table.Table
+        Catalog whose header will be updated in place.
+    data_catalog : astropy.table.Table, optional
+        Catalog with the derived columns, used to read the separation of the
+        closest source.
+    best_host : int, optional
+        Index of the best host in the catalog.
+    closest : int, optional
+        Index of the source closest to the transient.
+    best_host_source : str, optional
+        How the best host was picked, e.g. 'chance_coincidence', 'glade',
+        or 'input'.
+    force_detection : bool, optional
+        Whether the host association was forced.
+    hostless : bool, optional
+        Whether the transient was treated as hostless.
+
+    Returns
+    -------
+    input_catalog : astropy.table.Table
+        The same catalog, with the host metadata attached.
+    """
+    metadata = {
+        'best_host': best_host,
+        'best_host_source': best_host_source,
+        'best_host_forced': force_detection,
+        'hostless': hostless,
+        'closest_host': closest,
+        'closest_separation': None,
+    }
+
+    # Separation of the closest source, if it is available
+    if (data_catalog is not None and closest is not None and
+            'separation' in data_catalog.colnames):
+        closest = int(closest)
+        if 0 <= closest < len(data_catalog):
+            metadata['closest_separation'] = data_catalog['separation'][closest]
+
+    return set_catalog_meta(input_catalog, metadata)
 
 
 # Default limits for host galaxy mags
@@ -191,16 +362,49 @@ cached_glade = table.Table.read(glade_filename, format='ascii.fast_csv', delimit
 
 
 def write_catalog(catalog, catalog_path):
-    """Write a catalog without synthetic table-name comments."""
+    """
+    Write a catalog, with its ``key = value`` metadata header sorted into a
+    fixed order, and without synthetic table-name comments.
+
+    Parameters
+    ----------
+    catalog : astropy.table.Table
+        The catalog to write. Any ``key = value`` entries in
+        ``catalog.meta['comments']`` are written as the file header.
+    catalog_path : str
+        Path of the output file.
+    """
     output = catalog.copy()
     comments = output.meta.get('comments', [])
     if isinstance(comments, str):
         comments = [comments]
-    comments = [comment for comment in comments if str(comment).strip() != 'Table1']
+    comments = [str(comment) for comment in comments
+                if str(comment).strip() != 'Table1']
+
+    # Split the header into 'key = value' entries and free-form comments, and
+    # sort the entries so the header reads the same way for every object
+    keyed_comments = []
+    plain_comments = []
+    for comment in comments:
+        if '=' in comment:
+            keyed_comments.append((comment.split('=', 1)[0].strip(), comment))
+        else:
+            plain_comments.append(comment)
+
+    def meta_sort_key(item):
+        key = item[0]
+        if key in catalog_meta_order:
+            return (0, catalog_meta_order.index(key), key)
+        return (1, 0, key)
+
+    keyed_comments.sort(key=meta_sort_key)
+    comments = plain_comments + [comment for _, comment in keyed_comments]
+
     if comments:
         output.meta['comments'] = comments
     else:
         output.meta.pop('comments', None)
+
     output.write(catalog_path, format='ascii', overwrite=True)
 
 
@@ -383,6 +587,9 @@ def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
         Returns None if query fails or no objects found
     """
 
+    # Data release that ended up being used, which changes on a fallback
+    used_dr = DR
+
     if use_old:
         # Define Query
         SDSS_query = """SELECT p.objid, -- Object ID
@@ -432,6 +639,7 @@ def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
             except Exception as e2:
                 print(f"DR10 query also failed: {str(e2)}")
                 return None
+            used_dr = 10
 
         # Change name of objid
         if results is None or len(results) == 0:
@@ -500,6 +708,11 @@ def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
     mask = np.any(np.isfinite(sdss_mags), axis=1)
     results = results[mask]
     print(f'Found {len(results)} objects\n')
+
+    # Record which catalog, data release, and query produced these rows, so
+    # get_catalog can save them in the header of the merged catalog
+    results.meta['sdss_catalog'] = f'sdss_dr{used_dr}'
+    results.meta['sdss_query'] = 'sql' if use_old else 'region'
 
     return results
 
@@ -637,7 +850,8 @@ def query_sdss_redshift(ra_deg=None, dec_deg=None, objID=None, search_radius=3, 
 
 
 def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
-                    duplicate_distance=0.1, use_old=True):
+                    duplicate_distance=0.1, use_old=True,
+                    context='PanSTARRS_DR1'):
     """
     Query PanSTARRS DR2 3π survey for objects within a search radius of given coordinates.
 
@@ -656,6 +870,8 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
     use_old : bool, default False
         Use the old version of the query that requires
         an API key.
+    context : str, default 'PanSTARRS_DR1'
+        CasJobs context (database) to query when ``use_old`` is True.
 
     Returns
     --------
@@ -705,7 +921,9 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
 
         # Format Query
         print('Querying 3PI ...')
-        jobs = mastcasjobs.MastCasJobs(userid=wsid, password=password, context="PanSTARRS_DR1")
+        catalog_label = context.lower()
+        query_label = 'casjobs'
+        jobs = mastcasjobs.MastCasJobs(userid=wsid, password=password, context=context)
         results = jobs.quick(la_query, task_name="python cone search")
 
         # For New format
@@ -760,6 +978,8 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
 
         # Rename objID to objID_PS1
         output = catalog_data[keys]
+        catalog_label = f'panstarrs_dr{DR}'
+        query_label = 'region'
 
     # Add '_3pi' suffix to all column names
     for col in output.colnames:
@@ -780,6 +1000,11 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
     # If all values are NaN, remove the row
     mask = np.any(np.isfinite(psst_mags), axis=1)
     output = output[mask]
+
+    # Record which catalog and query produced these rows, so get_catalog can
+    # save them in the header of the merged catalog
+    output.meta['panstarrs_catalog'] = catalog_label
+    output.meta['panstarrs_query'] = query_label
 
     return output
 
@@ -1416,6 +1641,11 @@ def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
             _set_catalog_meta_value(
                 merged_catalog, 'wise_catalog', wise_catalog
             )
+            _set_catalog_meta_value(
+                merged_catalog, 'wise_matches', int(np.sum(np.isfinite(
+                    _catalog_floats(merged_catalog, 'separation_wise')
+                )))
+            )
             updated = True
         else:
             print('Using existing field-wide WISE catalog data.')
@@ -1439,6 +1669,11 @@ def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
             )
             _set_catalog_meta_value(
                 merged_catalog, 'gaia_catalog', 'gaiadr3'
+            )
+            _set_catalog_meta_value(
+                merged_catalog, 'gaia_matches', int(np.sum(np.isfinite(
+                    _catalog_floats(merged_catalog, 'separation_gaia')
+                )))
             )
             updated = True
         else:
@@ -1485,7 +1720,10 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0,
     Returns
     -------
     merged_catalog : astropy.table.Table
-        Merged catalog containing data from both SDSS and PSST
+        Merged catalog containing data from both SDSS and PSST. The
+        ``key = value`` header of the saved file records which catalogs and
+        data releases were queried, the search settings, and the number of
+        rows each survey contributed. Use ``get_catalog_meta`` to read it.
     """
 
     # Check if the catalog already exists
@@ -1495,6 +1733,26 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0,
     if not reimport_catalog and os.path.exists(catalog_path):
         print(f"\nLoading existing catalog from {catalog_path}")
         merged_catalog = table.Table.read(catalog_path, format='ascii')
+
+        # Fill in the basic metadata for catalogs saved by older versions of
+        # FLEET, without overwriting the provenance of the original query
+        existing_meta = get_catalog_meta(merged_catalog)
+        backfill = {
+            'object_name': object_name,
+            'ra_deg': ra_deg,
+            'dec_deg': dec_deg,
+            'search_radius_arcmin': search_radius,
+            'match_radius_arcsec': match_radius_arcsec,
+            'extinction_corrected': False,
+            'panstarrs_catalog': ('unknown' if 'objID_3pi' in
+                                  merged_catalog.colnames else 'none'),
+            'sdss_catalog': ('unknown' if 'objID_sdss' in
+                             merged_catalog.colnames else 'none'),
+        }
+        backfill = {key: value for key, value in backfill.items()
+                    if key not in existing_meta}
+        set_catalog_meta(merged_catalog, backfill)
+
         merged_catalog, updated = _add_field_catalogs(
             merged_catalog, ra_deg, dec_deg, search_radius,
             match_radius_arcsec, add_wise=add_wise, add_gaia=add_gaia,
@@ -1528,6 +1786,27 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0,
 
     # Sort the catalog by separation
     merged_catalog.sort('separation')
+
+    # Record where the rows came from and the settings used for the query, so
+    # the saved catalog documents itself
+    set_catalog_meta(merged_catalog, {
+        'fleet_version': fleet_version,
+        'catalog_date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+        'object_name': object_name,
+        'ra_deg': ra_deg,
+        'dec_deg': dec_deg,
+        'search_radius_arcmin': search_radius,
+        'match_radius_arcsec': match_radius_arcsec,
+        # Magnitudes are saved as queried, the extinction correction is
+        # applied later by catalog_operations
+        'extinction_corrected': False,
+        'panstarrs_catalog': _catalog_source_label(catalog_psst, 'panstarrs_catalog'),
+        'panstarrs_query': _catalog_source_label(catalog_psst, 'panstarrs_query'),
+        'panstarrs_rows': 0 if catalog_psst is None else len(catalog_psst),
+        'sdss_catalog': _catalog_source_label(catalog_sdss, 'sdss_catalog'),
+        'sdss_query': _catalog_source_label(catalog_sdss, 'sdss_query'),
+        'sdss_rows': 0 if catalog_sdss is None else len(catalog_sdss),
+    })
 
     merged_catalog, _ = _add_field_catalogs(
         merged_catalog, ra_deg, dec_deg, search_radius,
