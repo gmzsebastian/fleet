@@ -1801,11 +1801,13 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0,
     # If the catalog does not exist or reimport is requested, query the catalogs
     catalog_sdss = query_sdss(ra_deg, dec_deg, search_radius=search_radius, use_old=use_old)
     catalog_psst = query_panstarrs(ra_deg, dec_deg, search_radius=search_radius, use_old=use_old)
-    if catalog_psst is None:
+    # An empty table is not None, and a survey that found nothing cannot be
+    # cross-matched, so treat it the same way as a survey that was not queried
+    if catalog_psst is None or len(catalog_psst) == 0:
         merged_catalog = catalog_sdss
         merged_catalog['ra_matched'] = catalog_sdss['ra_sdss']
         merged_catalog['dec_matched'] = catalog_sdss['dec_sdss']
-    elif catalog_sdss is None:
+    elif catalog_sdss is None or len(catalog_sdss) == 0:
         merged_catalog = catalog_psst
         merged_catalog['ra_matched'] = catalog_psst['raStack_3pi']
         merged_catalog['dec_matched'] = catalog_psst['decStack_3pi']
