@@ -32,9 +32,15 @@ COPY . .
 RUN pip install --upgrade pip \
     && pip install . requests
 
-# Bake the SFD dust maps so dust_map='SFD' works offline.
-RUN mkdir -p "$DUSTMAPS_DATA_DIR" \
-    && python -c "from dustmaps.config import config; config['data_dir']='$DUSTMAPS_DATA_DIR'; import dustmaps.sfd; dustmaps.sfd.fetch()"
+# Bake the SFD dust maps so dust_map='SFD' works offline. dustmaps' own fetch()
+# pulls from Harvard Dataverse, which 403s; mirror the two FITS SkyPortal vendors
+# in skyportal/skyportal-data and point dustmaps at them for runtime SFDQuery().
+ARG SFD_BASE=https://github.com/skyportal/skyportal-data/raw/main/dustmaps/sfd
+RUN mkdir -p "$DUSTMAPS_DATA_DIR/sfd" \
+    && curl -fSL -o "$DUSTMAPS_DATA_DIR/sfd/SFD_dust_4096_ngp.fits" "$SFD_BASE/SFD_dust_4096_ngp.fits" \
+    && curl -fSL -o "$DUSTMAPS_DATA_DIR/sfd/SFD_dust_4096_sgp.fits" "$SFD_BASE/SFD_dust_4096_sgp.fits" \
+    && printf '{"data_dir": "%s"}\n' "$DUSTMAPS_DATA_DIR" > /root/.dustmapsrc \
+    && python -c "from dustmaps.sfd import SFDQuery; SFDQuery(); print('sfd ok')"
 
 # Train + bake the random-forest classifier pickles into $fleet_data.
 RUN mkdir -p "$fleet_data" \
