@@ -28,9 +28,10 @@ ENV PIP_NO_CACHE_DIR=1 \
 WORKDIR /src
 COPY . .
 
-# requests for the analysis-callback upload; setup.py pulls the science stack.
+# requests for the analysis-callback upload; dust_extinction is imported by
+# fleet.transient/catalog but missing from its setup.py; setup.py pulls the rest.
 RUN pip install --upgrade pip \
-    && pip install . requests
+    && pip install . requests dust_extinction
 
 # Bake the SFD dust maps so dust_map='SFD' works offline. dustmaps' own fetch()
 # pulls from Harvard Dataverse, which 403s; mirror the two FITS SkyPortal vendors
