@@ -10,10 +10,16 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord, match_coordinates_sky
 from astroquery.sdss import SDSS
 from astroquery.gaia import Gaia
-from astroquery.ipac.irsa import Irsa
 import time
 from astropy import table
 import pkg_resources
+from datetime import datetime, timezone
+from importlib.metadata import version as _package_version, PackageNotFoundError
+
+try:
+    fleet_version = _package_version('fleet_pipe')
+except PackageNotFoundError:  # pragma: no cover
+    fleet_version = 'unknown'
 
 try:
     fleet_data = os.environ['fleet_data']
@@ -23,6 +29,8 @@ except KeyError:
 # Central wavelengths for SDSS and 3PI filters
 sdss_refs = {'u': 3608.04, 'g': 4671.78, 'r': 6141.12, 'i': 7457.89, 'z': 8922.78}
 psst_refs = {'g': 4810.16, 'r': 6155.47, 'i': 7503.03, 'z': 8668.36, 'y': 9613.60}
+wise_refs = {'W1': 34000.0, 'W2': 46000.0, 'W3': 120000.0, 'W4': 220000.0}
+gaia_refs = {'BP': 5109.7, 'G': 6217.9, 'RP': 7769.1}
 
 # Survey limits for star/galaxy separation
 survey_limits = {'gPSFMag_3pi': 23.64,
@@ -35,6 +43,306 @@ survey_limits = {'gPSFMag_3pi': 23.64,
                  'psfMag_r_sdss': 22.59,
                  'psfMag_i_sdss': 22.04,
                  'psfMag_z_sdss': 21.58}
+
+# Vega to AB offsets for WISE, AB = Vega + offset
+wise_AB_offsets = {'W1': 2.699, 'W2': 3.339, 'W3': 5.174, 'W4': 6.620}
+
+# Gaia (E)DR3 Vega to AB offsets, calculated from the published zero points
+gaia_AB_offsets = {'BP': 0.0154133392, 'G': 0.1136777774, 'RP': 0.3560882381}
+
+gaia_columns = (
+    'ra', 'ra_error', 'dec', 'dec_error',
+    'parallax', 'parallax_error', 'pm',
+    'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
+    'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag'
+)
+gaia_units = {
+    'ra': u.deg,
+    'ra_error': u.mas,
+    'dec': u.deg,
+    'dec_error': u.mas,
+    'parallax': u.mas,
+    'parallax_error': u.mas,
+    'pm': u.mas / u.yr,
+    'pmra': u.mas / u.yr,
+    'pmra_error': u.mas / u.yr,
+    'pmdec': u.mas / u.yr,
+    'pmdec_error': u.mas / u.yr,
+    'phot_g_mean_mag': u.mag,
+    'phot_bp_mean_mag': u.mag,
+    'phot_rp_mean_mag': u.mag,
+}
+
+
+def wise_catalog_columns(catalog='unwise'):
+    """Return the bands and saved-column schema for a WISE catalog."""
+    catalog = catalog.lower()
+    band_sets = {
+        'unwise': ('W1', 'W2'),
+        'allwise': ('W1', 'W2', 'W3', 'W4'),
+    }
+    if catalog not in band_sets:
+        raise ValueError("catalog must be 'allwise' or 'unwise'")
+
+    bands = band_sets[catalog]
+    required_columns = [
+        'objid_wise', 'ra_wise', 'dec_wise', 'separation_wise'
+    ]
+    for band in bands:
+        required_columns.extend([
+            f'{band}_AB_wise', f'{band}_AB_err_wise',
+            f'{band}_limit_wise'
+        ])
+    value_columns = ['objid_wise', 'separation_wise'] + [
+        f'{band}_AB_wise' for band in bands
+    ]
+    return bands, required_columns, value_columns
+
+
+def gaia_catalog_columns():
+    """Return the saved-column schema for a Gaia match."""
+    required_columns = [
+        f'{column_name}_gaia' for column_name in gaia_columns
+    ] + ['separation_gaia']
+    return required_columns, required_columns
+
+
+def catalog_match_available(input_catalog, required_columns, value_columns,
+                            row_index=None):
+    """Return whether saved enrichment columns contain a catalog match."""
+    if any(column not in input_catalog.colnames for column in required_columns):
+        return False
+    if len(input_catalog) == 0:
+        return False
+
+    if row_index is None:
+        row_indices = range(len(input_catalog))
+    elif 0 <= int(row_index) < len(input_catalog):
+        row_indices = (int(row_index),)
+    else:
+        return False
+
+    for index in row_indices:
+        for column_name in value_columns:
+            value = input_catalog[column_name][index]
+            if np.ma.is_masked(value):
+                continue
+            if isinstance(value, bytes):
+                value = value.decode()
+            if isinstance(value, str):
+                if value.strip().lower() not in ('', '--', 'nan', 'none'):
+                    return True
+            else:
+                try:
+                    if np.isfinite(float(value)):
+                        return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+
+def _catalog_meta_value(input_catalog, key):
+    """Read a ``key = value`` entry from catalog comments."""
+    comments = input_catalog.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+    prefix = f'{key} ='
+    for comment in comments:
+        if str(comment).startswith(prefix):
+            return str(comment).split('=', 1)[1].strip()
+    return None
+
+
+def _set_catalog_meta_value(input_catalog, key, value):
+    """Set a ``key = value`` entry in catalog comments."""
+    comments = input_catalog.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+    prefix = f'{key} ='
+    comments = [comment for comment in comments
+                if not str(comment).startswith(prefix)]
+    comments.append(f'{key} = {_format_meta_value(value)}')
+    input_catalog.meta['comments'] = comments
+
+
+def clear_catalog_field_marker(input_catalog, service):
+    """Remove field-query metadata after a host-only enrichment replaces it."""
+    key = f'{service}_field_catalog'
+    comments = input_catalog.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+    prefix = f'{key} ='
+    comments = [comment for comment in comments
+                if not str(comment).startswith(prefix)]
+    if comments:
+        input_catalog.meta['comments'] = comments
+    else:
+        input_catalog.meta.pop('comments', None)
+
+
+# Preferred order of the 'key = value' entries in the catalog header. Any key
+# that is not listed here is written after these, in alphabetical order.
+catalog_meta_order = [
+    # Provenance of the file itself
+    'fleet_version', 'catalog_date', 'object_name', 'ra_deg', 'dec_deg',
+    'search_radius_arcmin', 'match_radius_arcsec', 'extinction_corrected',
+    # Which catalogs were queried, how, and how many rows each contributed
+    'panstarrs_catalog', 'panstarrs_query', 'panstarrs_rows',
+    'sdss_catalog', 'sdss_query', 'sdss_rows',
+    'wise_catalog', 'wise_matches',
+    'gaia_catalog', 'gaia_matches',
+    # The host that FLEET ended up selecting
+    'best_host', 'best_host_source', 'best_host_forced', 'hostless',
+    'closest_host', 'closest_separation',
+]
+
+
+def _format_meta_value(value):
+    """
+    Format one value for a ``key = value`` entry of a catalog header. Missing
+    values of any kind are written as 'None', and whole numbers are written
+    without a decimal point.
+
+    Parameters
+    ----------
+    value : any
+        The value to format.
+
+    Returns
+    -------
+    str
+        The value as a single-line string.
+    """
+    if value is None:
+        return 'None'
+    if isinstance(value, bytes):
+        value = value.decode()
+    if np.ma.is_masked(value):
+        return 'None'
+    # Booleans have to be checked before integers, since bool is an int
+    if isinstance(value, (bool, np.bool_)):
+        return str(bool(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        if not np.isfinite(value):
+            return 'None'
+        # Whole numbers are written without decimals, so indices stay readable
+        if value.is_integer():
+            return str(int(value))
+        return f'{value:.8f}'.rstrip('0')
+
+    text = str(value).strip().replace('\n', ' ')
+    return text if text else 'None'
+
+
+def set_catalog_meta(input_catalog, metadata):
+    """
+    Set several ``key = value`` entries in the header of a catalog at once.
+
+    Parameters
+    ----------
+    input_catalog : astropy.table.Table
+        Catalog to modify in place.
+    metadata : dict
+        Mapping of header keys to values.
+
+    Returns
+    -------
+    input_catalog : astropy.table.Table
+        The same catalog, with the metadata attached.
+    """
+    for key, value in metadata.items():
+        _set_catalog_meta_value(input_catalog, key, value)
+    return input_catalog
+
+
+def get_catalog_meta(input_catalog):
+    """
+    Read every ``key = value`` entry of a catalog header into a dictionary.
+    This is the counterpart of ``set_catalog_meta``, and works on catalogs
+    that were just built as well as ones read back from a file.
+
+    Parameters
+    ----------
+    input_catalog : astropy.table.Table
+        Catalog with a metadata header.
+
+    Returns
+    -------
+    metadata : dict
+        Mapping of header keys to their (string) values.
+    """
+    comments = input_catalog.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+
+    metadata = {}
+    for comment in comments:
+        text = str(comment)
+        if '=' not in text:
+            continue
+        key, value = text.split('=', 1)
+        metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def _catalog_source_label(source_catalog, key, default='none'):
+    """Return a provenance label that was stored by a catalog query."""
+    if source_catalog is None:
+        return default
+    return source_catalog.meta.get(key, 'unknown')
+
+
+def add_host_metadata(input_catalog, data_catalog=None, best_host=None, closest=None,
+                      best_host_source=None, force_detection=None, hostless=None):
+    """
+    Record which row of the catalog was selected as the host galaxy in the
+    header of a catalog, so the choice can be recovered from the saved file.
+
+    Parameters
+    ----------
+    input_catalog : astropy.table.Table
+        Catalog whose header will be updated in place.
+    data_catalog : astropy.table.Table, optional
+        Catalog with the derived columns, used to read the separation of the
+        closest source.
+    best_host : int, optional
+        Index of the best host in the catalog.
+    closest : int, optional
+        Index of the source closest to the transient.
+    best_host_source : str, optional
+        How the best host was picked, e.g. 'chance_coincidence', 'glade',
+        or 'input'.
+    force_detection : bool, optional
+        Whether the host association was forced.
+    hostless : bool, optional
+        Whether the transient was treated as hostless.
+
+    Returns
+    -------
+    input_catalog : astropy.table.Table
+        The same catalog, with the host metadata attached.
+    """
+    metadata = {
+        'best_host': best_host,
+        'best_host_source': best_host_source,
+        'best_host_forced': force_detection,
+        'hostless': hostless,
+        'closest_host': closest,
+        'closest_separation': None,
+    }
+
+    # Separation of the closest source, if it is available
+    if (data_catalog is not None and closest is not None and
+            'separation' in data_catalog.colnames):
+        closest = int(closest)
+        if 0 <= closest < len(data_catalog):
+            metadata['closest_separation'] = data_catalog['separation'][closest]
+
+    return set_catalog_meta(input_catalog, metadata)
+
 
 # Default limits for host galaxy mags
 host_limit = {'u': 23.42,
@@ -51,6 +359,53 @@ cached_catalog = table.Table.read(classification_catalog_filename, format='ascii
 # Import GLADE data to classify objects as star/galaxy
 glade_filename = pkg_resources.resource_filename(__name__, 'GLADE_short.txt')
 cached_glade = table.Table.read(glade_filename, format='ascii.fast_csv', delimiter=',', guess=False)
+
+
+def write_catalog(catalog, catalog_path):
+    """
+    Write a catalog, with its ``key = value`` metadata header sorted into a
+    fixed order, and without synthetic table-name comments.
+
+    Parameters
+    ----------
+    catalog : astropy.table.Table
+        The catalog to write. Any ``key = value`` entries in
+        ``catalog.meta['comments']`` are written as the file header.
+    catalog_path : str
+        Path of the output file.
+    """
+    output = catalog.copy()
+    comments = output.meta.get('comments', [])
+    if isinstance(comments, str):
+        comments = [comments]
+    comments = [str(comment) for comment in comments
+                if str(comment).strip() != 'Table1']
+
+    # Split the header into 'key = value' entries and free-form comments, and
+    # sort the entries so the header reads the same way for every object
+    keyed_comments = []
+    plain_comments = []
+    for comment in comments:
+        if '=' in comment:
+            keyed_comments.append((comment.split('=', 1)[0].strip(), comment))
+        else:
+            plain_comments.append(comment)
+
+    def meta_sort_key(item):
+        key = item[0]
+        if key in catalog_meta_order:
+            return (0, catalog_meta_order.index(key), key)
+        return (1, 0, key)
+
+    keyed_comments.sort(key=meta_sort_key)
+    comments = plain_comments + [comment for _, comment in keyed_comments]
+
+    if comments:
+        output.meta['comments'] = comments
+    else:
+        output.meta.pop('comments', None)
+
+    output.write(catalog_path, format='ascii', overwrite=True)
 
 
 def clean_table(catalog, replace_value=np.nan):
@@ -128,6 +483,12 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
     if ra_key not in catalog.colnames or dec_key not in catalog.colnames:
         raise ValueError(f"Coordinate columns {ra_key} and/or {dec_key} not found in catalog")
 
+    # Columns that must never be averaged, the mean of two object IDs is not a
+    # real object and the mean of two integer type codes is not a real type
+    identifier_columns = ('objID_3pi', 'objID_sdss', 'objInfoFlag_3pi',
+                          'nDetections_3pi', 'primaryDetection_3pi',
+                          'type_sdss', 'clean_sdss')
+
     # Create SkyCoord objects for all sources
     coords = SkyCoord(ra=catalog[ra_key], dec=catalog[dec_key], unit='degree')
 
@@ -152,9 +513,12 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
         if processed[i]:
             continue  # Skip already processed entries
 
-        # Find all entries within duplicate_distance of this one
+        # Find all entries within duplicate_distance of this one, skipping any
+        # that were already merged into an earlier group, so that no source is
+        # counted twice when duplicates are chained (A-B and B-C but not A-C)
         separations = coords[i].separation(coords)
         duplicate_indices = np.where(separations < duplicate_distance * u.arcsec)[0]
+        duplicate_indices = duplicate_indices[~processed[duplicate_indices]]
 
         # Mark all duplicates as processed
         processed[duplicate_indices] = True
@@ -167,6 +531,22 @@ def merge_duplicates(catalog, ra_key, dec_key, duplicate_distance=0.1):
             # Initialize a row for the merged entry
             merged_row = []
             for col in catalog.colnames:
+                # Average right ascension through the offsets from the first
+                # source, so the average does not jump across RA = 0/360
+                if col == ra_key:
+                    reference = float(duplicates[col][0])
+                    offsets = (np.array(duplicates[col], dtype=float)
+                               - reference + 180) % 360 - 180
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", category=RuntimeWarning)
+                        merged_row.append((reference + np.nanmean(offsets)) % 360)
+                    continue
+                # Identifiers, flags and any non-float column take the value of
+                # a representative source instead of being averaged
+                if col in identifier_columns or not np.issubdtype(duplicates[col].dtype, np.floating):
+                    non_empty = [val for val in duplicates[col] if val]
+                    merged_row.append(non_empty[0] if non_empty else duplicates[col][0])
+                    continue
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -232,6 +612,9 @@ def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
         Returns None if query fails or no objects found
     """
 
+    # Data release that ended up being used, which changes on a fallback
+    used_dr = DR
+
     if use_old:
         # Define Query
         SDSS_query = """SELECT p.objid, -- Object ID
@@ -281,6 +664,7 @@ def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
             except Exception as e2:
                 print(f"DR10 query also failed: {str(e2)}")
                 return None
+            used_dr = 10
 
         # Change name of objid
         if results is None or len(results) == 0:
@@ -349,6 +733,11 @@ def query_sdss(ra_deg, dec_deg, search_radius=1.0, DR=18,
     mask = np.any(np.isfinite(sdss_mags), axis=1)
     results = results[mask]
     print(f'Found {len(results)} objects\n')
+
+    # Record which catalog, data release, and query produced these rows, so
+    # get_catalog can save them in the header of the merged catalog
+    results.meta['sdss_catalog'] = f'sdss_dr{used_dr}'
+    results.meta['sdss_query'] = 'sql' if use_old else 'region'
 
     return results
 
@@ -486,7 +875,8 @@ def query_sdss_redshift(ra_deg=None, dec_deg=None, objID=None, search_radius=3, 
 
 
 def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
-                    duplicate_distance=0.1, use_old=True):
+                    duplicate_distance=0.1, use_old=True,
+                    context='PanSTARRS_DR1'):
     """
     Query PanSTARRS DR2 3π survey for objects within a search radius of given coordinates.
 
@@ -505,6 +895,8 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
     use_old : bool, default False
         Use the old version of the query that requires
         an API key.
+    context : str, default 'PanSTARRS_DR1'
+        CasJobs context (database) to query when ``use_old`` is True.
 
     Returns
     --------
@@ -554,7 +946,9 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
 
         # Format Query
         print('Querying 3PI ...')
-        jobs = mastcasjobs.MastCasJobs(userid=wsid, password=password, context="PanSTARRS_DR1")
+        catalog_label = context.lower()
+        query_label = 'casjobs'
+        jobs = mastcasjobs.MastCasJobs(userid=wsid, password=password, context=context)
         results = jobs.quick(la_query, task_name="python cone search")
 
         # For New format
@@ -609,6 +1003,8 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
 
         # Rename objID to objID_PS1
         output = catalog_data[keys]
+        catalog_label = f'panstarrs_dr{DR}'
+        query_label = 'region'
 
     # Add '_3pi' suffix to all column names
     for col in output.colnames:
@@ -630,136 +1026,380 @@ def query_panstarrs(ra_deg, dec_deg, search_radius=1, DR=2,
     mask = np.any(np.isfinite(psst_mags), axis=1)
     output = output[mask]
 
+    # Record which catalog and query produced these rows, so get_catalog can
+    # save them in the header of the merged catalog
+    output.meta['panstarrs_catalog'] = catalog_label
+    output.meta['panstarrs_query'] = query_label
+
     return output
 
 
-def query_gaia(ra_deg, dec_deg, search_radius=1.0, DR=3, gaia_limit=10, use_vizier=False):
-    """
-    Query Gaia for objects within a search radius of given coordinates.
+def query_gaia(ra_deg, dec_deg, search_radius=5.0, DR=3, gaia_limit=10,
+               use_vizier=False):
+    """Query Gaia within ``search_radius`` arcseconds of a position."""
+    coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
 
-    Parameters
-    -----------
-    ra_deg : float
-        Right Ascension in degrees
-    dec_deg : float
-        Declination in degrees
-    search_radius : float
-        Search radius in arcsec
-    DR : int, default 3
-        Gaia Data Release
-    gaia_limit : int, default 10
-        Maximum number of sources to return
-    use_vizier : bool, default False
-        If True, query Gaia via VizieR instead of Gaia archive
-
-    Returns
-    --------
-    catalog_gaia : astropy.table.Table or None
-        Table containing Gaia data
-    """
-
-    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.degree, u.degree), frame='icrs')
-
-    if not use_vizier:
-        # ---- Original behavior (Gaia archive) ----
-        Gaia.ROW_LIMIT = gaia_limit
-        Gaia.MAIN_GAIA_TABLE = f"gaiadr{DR}.gaia_source"
-
-        gaia_query = Gaia.cone_search_async(coord, radius=u.Quantity(search_radius, u.arcsec))
-        gaia_table = gaia_query.get_results()
-
-        catalog_gaia = gaia_table[
-            'ra', 'ra_error', 'dec', 'dec_error',
-            'parallax', 'parallax_error', 'pm',
-            'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
-            'phot_g_mean_mag', 'phot_bp_mean_mag',
-            'phot_rp_mean_mag'
-        ]
-
-        return catalog_gaia
-
-    else:
-        # ---- VizieR behavior ----
-        if DR == 3:
-            catalog_id = "I/355/gaiadr3"
-        elif DR == 2:
-            catalog_id = "I/345/gaia2"
+    print(f"Querying Gaia DR{DR}...")
+    try:
+        if not use_vizier:
+            Gaia.ROW_LIMIT = gaia_limit
+            Gaia.MAIN_GAIA_TABLE = f'gaiadr{DR}.gaia_source'
+            job = Gaia.cone_search(coord, radius=search_radius * u.arcsec,
+                                   columns=gaia_columns)
+            result = job.get_results()
+            catalog_gaia = result[list(gaia_columns)]
         else:
-            raise ValueError("VizieR Gaia only supports DR2 or DR3")
+            if DR == 3:
+                catalog_id = 'I/355/gaiadr3'
+            elif DR == 2:
+                catalog_id = 'I/345/gaia2'
+            else:
+                raise ValueError('VizieR Gaia only supports DR2 or DR3')
 
-        vizier = Vizier(
-            catalog=catalog_id,
-            columns=[
-                'RA_ICRS', 'e_RA_ICRS',
-                'DE_ICRS', 'e_DE_ICRS',
-                'Plx', 'e_Plx',
-                'pmRA', 'e_pmRA',
-                'pmDE', 'e_pmDE',
-                'Gmag', 'BPmag', 'RPmag'
-            ],
-            row_limit=gaia_limit
-        )
+            vizier = Vizier(
+                catalog=catalog_id,
+                columns=[
+                    'RA_ICRS', 'e_RA_ICRS', 'DE_ICRS', 'e_DE_ICRS',
+                    'Plx', 'e_Plx', 'pmRA', 'e_pmRA', 'pmDE', 'e_pmDE',
+                    'Gmag', 'BPmag', 'RPmag'
+                ],
+                row_limit=gaia_limit
+            )
+            result = vizier.query_region(
+                coord, radius=search_radius * u.arcsec, catalog=catalog_id
+            )
+            if not result:
+                return _empty_gaia_catalog()
 
-        result = vizier.query_region(
-            coord,
-            radius=u.Quantity(search_radius, u.arcsec),
-            catalog=catalog_id
-        )
+            catalog_gaia = result[0]
+            catalog_gaia.rename_columns(
+                ['RA_ICRS', 'e_RA_ICRS', 'DE_ICRS', 'e_DE_ICRS',
+                 'Plx', 'e_Plx', 'pmRA', 'e_pmRA', 'pmDE', 'e_pmDE',
+                 'Gmag', 'BPmag', 'RPmag'],
+                ['ra', 'ra_error', 'dec', 'dec_error',
+                 'parallax', 'parallax_error',
+                 'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
+                 'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag']
+            )
+            catalog_gaia['pm'] = np.sqrt(
+                catalog_gaia['pmra'] ** 2 + catalog_gaia['pmdec'] ** 2
+            )
+            catalog_gaia = catalog_gaia[list(gaia_columns)]
+    except ValueError:
+        raise
+    except Exception as error:
+        print(f'Error querying Gaia: {error}')
+        return _empty_gaia_catalog()
 
-        if len(result) == 0:
-            return None
+    return catalog_gaia
 
-        catalog_gaia = result[0]
 
-        # Rename columns to match Gaia archive naming as closely as possible
-        catalog_gaia.rename_columns(
-            ['RA_ICRS', 'e_RA_ICRS', 'DE_ICRS', 'e_DE_ICRS',
-             'Plx', 'e_Plx', 'pmRA', 'e_pmRA', 'pmDE', 'e_pmDE',
-             'Gmag', 'BPmag', 'RPmag'],
-            ['ra', 'ra_error', 'dec', 'dec_error',
-             'parallax', 'parallax_error',
-             'pmra', 'pmra_error', 'pmdec', 'pmdec_error',
-             'phot_g_mean_mag', 'phot_bp_mean_mag', 'phot_rp_mean_mag']
-        )
+def merge_gaia(merged_catalog, catalog_gaia, host_index=None,
+               match_radius_arcsec=1.5, match_all=False):
+    """Attach nearest Gaia matches to the best host or every catalog row."""
+    for column_name in gaia_columns:
+        output_name = f'{column_name}_gaia'
+        merged_catalog[output_name] = np.full(len(merged_catalog), np.nan)
+        unit = gaia_units[column_name]
+        if catalog_gaia is not None and column_name in catalog_gaia.colnames:
+            unit = catalog_gaia[column_name].unit or unit
+        merged_catalog[output_name].unit = unit
 
-        # Add total proper motion column (to match Gaia archive output)
-        if 'pmra' in catalog_gaia.colnames and 'pmdec' in catalog_gaia.colnames:
-            catalog_gaia['pm'] = (catalog_gaia['pmra']**2 + catalog_gaia['pmdec']**2)**0.5
+    merged_catalog['separation_gaia'] = np.full(len(merged_catalog), np.nan)
+    merged_catalog['separation_gaia'].unit = u.arcsec
 
-        return catalog_gaia
+    catalog_indices, match_indices, separations = _nearest_catalog_matches(
+        merged_catalog, catalog_gaia, host_index,
+        ra_column='ra', dec_column='dec',
+        match_radius_arcsec=match_radius_arcsec, match_all=match_all
+    )
+    if len(catalog_indices) == 0:
+        return merged_catalog
 
-def query_wise(ra_deg, dec_deg, search_radius=1.0, data_table="allwise_p3as_psd"):
-    """
-    Query WISE for objects within a search radius of given coordinates.
+    for column_name in gaia_columns:
+        values = _catalog_floats(catalog_gaia, column_name)[match_indices]
+        merged_catalog[f'{column_name}_gaia'][catalog_indices] = values
+    merged_catalog['separation_gaia'][catalog_indices] = separations
+    return merged_catalog
+
+
+def _empty_gaia_catalog():
+    """Return an empty Gaia table with the standard query columns."""
+    catalog_gaia = table.Table()
+    for column_name in gaia_columns:
+        catalog_gaia[column_name] = np.array([], dtype=float)
+        catalog_gaia[column_name].unit = gaia_units[column_name]
+    return catalog_gaia
+
+
+def query_wise(ra_deg, dec_deg, search_radius=5.0, catalog='unwise', snr_limit=2.0):
+    """Query a WISE catalog through VizieR and return AB photometry.
 
     Parameters
     ----------
-    ra_deg : float
-        Right Ascension in degrees
-    dec_deg : float
-        Declination in degrees
+    ra_deg, dec_deg : float
+        Query position in degrees.
     search_radius : float
-        Search radius in arcsec
-    data_table : str
-        Name of the WISE data table to query
+        Search radius in arcseconds.
+    catalog : {'allwise', 'unwise'}
+        WISE catalog to query. ``allwise`` uses II/328/allwise and returns
+        W1--W4. ``unwise`` uses II/363/unwise and returns W1 and W2.
+    snr_limit : float
+        unWISE measurements below this signal-to-noise ratio are returned as
+        upper limits. This parameter is not used for AllWISE, whose catalog
+        already identifies upper limits.
 
     Returns
     -------
-    catalog_wise : astropy.table.Table or None
-        Table containing WISE data
+    astropy.table.Table
+        A normalized WISE table with coordinates, source ID, AB magnitudes,
+        magnitude errors, and upper-limit flags.
     """
+    catalog = catalog.lower()
+    catalog_config = {
+        'allwise': {
+            'id': 'II/328/allwise',
+            'bands': ('W1', 'W2', 'W3', 'W4'),
+            'columns': ['AllWISE', 'RAJ2000', 'DEJ2000',
+                        'W1mag', 'e_W1mag', 'W2mag', 'e_W2mag',
+                        'W3mag', 'e_W3mag', 'W4mag', 'e_W4mag', 'qph'],
+        },
+        'unwise': {
+            'id': 'II/363/unwise',
+            'bands': ('W1', 'W2'),
+            'columns': ['objID', 'RAJ2000', 'DEJ2000',
+                        'FW1', 'e_FW1', 'FW2', 'e_FW2', 'Prim'],
+        },
+    }
+    if catalog not in catalog_config:
+        choices = ', '.join(catalog_config)
+        raise ValueError(f"catalog must be one of: {choices}")
 
-    # Query Catalog
-    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit=(u.degree, u.degree), frame='icrs')
-    catalog_wise = Irsa.query_region(
-        coordinates=coord,
-        catalog=data_table,
-        spatial="Cone",
-        radius=u.Quantity(search_radius, u.arcsec),
-        columns="designation,ra,dec,sigra,sigdec,sigradec,w1mag,w1sigm,w2mag,w2sigm,w3mag,w3sigm,w4mag,w4sigm"
+    config = catalog_config[catalog]
+    catalog_wise = _empty_wise_catalog(config['bands'], catalog)
+    coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
+    vizier = Vizier(catalog=config['id'], columns=config['columns'], row_limit=1000)
+
+    print(f"\nQuerying {catalog} ...")
+    try:
+        result = vizier.query_region(
+            coord,
+            radius=search_radius * u.arcsec,
+            catalog=config['id']
+        )
+    except Exception as error:
+        print(f"Error querying {catalog}: {error}")
+        return catalog_wise
+
+    if not result:
+        print('Found 0 objects\n')
+        return catalog_wise
+
+    raw_catalog = result[0]
+    if catalog == 'unwise' and 'Prim' in raw_catalog.colnames:
+        raw_catalog = raw_catalog[_catalog_floats(raw_catalog, 'Prim') == 1]
+
+    catalog_wise = _empty_wise_catalog(config['bands'], catalog, len(raw_catalog))
+    catalog_wise['objid_wise'][:] = _wise_strings(
+        raw_catalog, 'AllWISE' if catalog == 'allwise' else 'objID'
     )
+    catalog_wise['ra_wise'][:] = _catalog_floats(raw_catalog, 'RAJ2000')
+    catalog_wise['dec_wise'][:] = _catalog_floats(raw_catalog, 'DEJ2000')
 
+    if catalog == 'allwise':
+        quality = _wise_strings(raw_catalog, 'qph')
+        for index, band in enumerate(config['bands']):
+            magnitude = _catalog_floats(raw_catalog, f'{band}mag')
+            magnitude += wise_AB_offsets[band]
+            catalog_wise[f'{band}_AB_wise'][:] = magnitude
+            catalog_wise[f'{band}_AB_err_wise'][:] = _catalog_floats(
+                raw_catalog, f'e_{band}mag'
+            )
+            catalog_wise[f'{band}_limit_wise'][:] = np.array([
+                'True' if value != '--' and len(value) > index and
+                value[index] == 'U' else 'False'
+                for value in quality
+            ], dtype='U5')
+    else:
+        for band in config['bands']:
+            flux = _catalog_floats(raw_catalog, f'F{band}')
+            flux_error = _catalog_floats(raw_catalog, f'e_F{band}')
+            good_error = np.isfinite(flux_error) & (flux_error > 0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                signal_to_noise = flux / flux_error
+            detected = (np.isfinite(flux) & (flux > 0) & good_error &
+                        (signal_to_noise >= snr_limit))
+            upper_limit = good_error & ~detected
+
+            magnitude = np.full(len(raw_catalog), np.nan)
+            magnitude_error = np.full(len(raw_catalog), np.nan)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                magnitude[detected] = 22.5 - 2.5 * np.log10(flux[detected])
+                magnitude[upper_limit] = (
+                    22.5 - 2.5 * np.log10(snr_limit * flux_error[upper_limit])
+                )
+                magnitude_error[detected] = (
+                    2.5 / np.log(10.0) * flux_error[detected] / flux[detected]
+                )
+            magnitude += wise_AB_offsets[band]
+
+            catalog_wise[f'{band}_AB_wise'][:] = magnitude
+            catalog_wise[f'{band}_AB_err_wise'][:] = magnitude_error
+            catalog_wise[f'{band}_limit_wise'][:] = np.where(
+                upper_limit, 'True', 'False'
+            )
+
+    print(f'Found {len(catalog_wise)} objects\n')
     return catalog_wise
+
+
+def merge_wise(merged_catalog, catalog_wise, host_index=None,
+               match_radius_arcsec=1.5, catalog='unwise', match_all=False):
+    """Attach nearest WISE matches to the best host or every catalog row."""
+    n_rows = len(merged_catalog)
+    if catalog_wise is None:
+        bands, _, _ = wise_catalog_columns(catalog)
+    else:
+        bands = tuple(
+            band for band in wise_AB_offsets
+            if f'{band}_AB_wise' in catalog_wise.colnames
+        )
+
+    for band in bands:
+        merged_catalog[f'{band}_AB_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_AB_wise'].unit = u.mag
+        merged_catalog[f'{band}_AB_err_wise'] = np.full(n_rows, np.nan)
+        merged_catalog[f'{band}_AB_err_wise'].unit = u.mag
+        merged_catalog[f'{band}_limit_wise'] = np.full(n_rows, 'False', dtype='U5')
+    merged_catalog['objid_wise'] = np.full(n_rows, '--', dtype='U32')
+    merged_catalog['ra_wise'] = np.full(n_rows, np.nan)
+    merged_catalog['ra_wise'].unit = u.deg
+    merged_catalog['dec_wise'] = np.full(n_rows, np.nan)
+    merged_catalog['dec_wise'].unit = u.deg
+    merged_catalog['separation_wise'] = np.full(n_rows, np.nan)
+    merged_catalog['separation_wise'].unit = u.arcsec
+
+    catalog_indices, match_indices, separations = _nearest_catalog_matches(
+        merged_catalog, catalog_wise, host_index,
+        ra_column='ra_wise', dec_column='dec_wise',
+        match_radius_arcsec=match_radius_arcsec, match_all=match_all
+    )
+    if len(catalog_indices) == 0:
+        return merged_catalog
+
+    for band in bands:
+        merged_catalog[f'{band}_AB_wise'][catalog_indices] = _catalog_floats(
+            catalog_wise, f'{band}_AB_wise'
+        )[match_indices]
+        merged_catalog[f'{band}_AB_err_wise'][catalog_indices] = _catalog_floats(
+            catalog_wise, f'{band}_AB_err_wise'
+        )[match_indices]
+        merged_catalog[f'{band}_limit_wise'][catalog_indices] = _wise_strings(
+            catalog_wise, f'{band}_limit_wise'
+        )[match_indices]
+
+    merged_catalog['objid_wise'][catalog_indices] = _wise_strings(
+        catalog_wise, 'objid_wise'
+    )[match_indices]
+    merged_catalog['ra_wise'][catalog_indices] = _catalog_floats(
+        catalog_wise, 'ra_wise'
+    )[match_indices]
+    merged_catalog['dec_wise'][catalog_indices] = _catalog_floats(
+        catalog_wise, 'dec_wise'
+    )[match_indices]
+    merged_catalog['separation_wise'][catalog_indices] = separations
+    return merged_catalog
+
+
+def _nearest_catalog_matches(merged_catalog, source_catalog, host_index,
+                             ra_column, dec_column, match_radius_arcsec,
+                             match_all=False):
+    """Return nearest source matches for one host or all catalog rows."""
+    empty_indices = np.array([], dtype=int)
+    empty_separations = np.array([], dtype=float)
+    if (source_catalog is None or len(source_catalog) == 0 or
+            len(merged_catalog) == 0):
+        return empty_indices, empty_indices, empty_separations
+
+    if match_all:
+        catalog_indices = np.arange(len(merged_catalog), dtype=int)
+    elif host_index is not None and 0 <= int(host_index) < len(merged_catalog):
+        catalog_indices = np.array([int(host_index)], dtype=int)
+    else:
+        return empty_indices, empty_indices, empty_separations
+
+    catalog_ra = _catalog_floats(merged_catalog, 'ra_matched')[catalog_indices]
+    catalog_dec = _catalog_floats(merged_catalog, 'dec_matched')[catalog_indices]
+    valid_catalog = np.isfinite(catalog_ra) & np.isfinite(catalog_dec)
+    catalog_indices = catalog_indices[valid_catalog]
+    if len(catalog_indices) == 0:
+        return empty_indices, empty_indices, empty_separations
+
+    source_ra = _catalog_floats(source_catalog, ra_column)
+    source_dec = _catalog_floats(source_catalog, dec_column)
+    valid_sources = np.isfinite(source_ra) & np.isfinite(source_dec)
+    if not np.any(valid_sources):
+        return empty_indices, empty_indices, empty_separations
+
+    source_indices = np.flatnonzero(valid_sources)
+    catalog_coords = SkyCoord(
+        _catalog_floats(merged_catalog, 'ra_matched')[catalog_indices] * u.deg,
+        _catalog_floats(merged_catalog, 'dec_matched')[catalog_indices] * u.deg
+    )
+    source_coords = SkyCoord(
+        source_ra[valid_sources] * u.deg,
+        source_dec[valid_sources] * u.deg
+    )
+    nearest, separations, _ = match_coordinates_sky(catalog_coords, source_coords)
+    separations = separations.to_value(u.arcsec)
+    matched = np.isfinite(separations) & (separations <= match_radius_arcsec)
+    return (catalog_indices[matched], source_indices[nearest[matched]],
+            separations[matched])
+
+
+def _empty_wise_catalog(bands, catalog_name, n_rows=0):
+    """Create an empty normalized WISE table with the requested band schema."""
+    catalog_wise = table.Table()
+    catalog_wise.meta['wise_catalog'] = catalog_name
+    catalog_wise['objid_wise'] = np.full(n_rows, '--', dtype='U32')
+    catalog_wise['ra_wise'] = np.full(n_rows, np.nan)
+    catalog_wise['ra_wise'].unit = u.deg
+    catalog_wise['dec_wise'] = np.full(n_rows, np.nan)
+    catalog_wise['dec_wise'].unit = u.deg
+    for band in bands:
+        catalog_wise[f'{band}_AB_wise'] = np.full(n_rows, np.nan)
+        catalog_wise[f'{band}_AB_wise'].unit = u.mag
+        catalog_wise[f'{band}_AB_err_wise'] = np.full(n_rows, np.nan)
+        catalog_wise[f'{band}_AB_err_wise'].unit = u.mag
+        catalog_wise[f'{band}_limit_wise'] = np.full(n_rows, 'False', dtype='U5')
+    return catalog_wise
+
+
+def _catalog_floats(input_catalog, column_name):
+    """Return a catalog column as floats, with NaN for missing values."""
+    if column_name not in input_catalog.colnames:
+        return np.full(len(input_catalog), np.nan)
+
+    column = input_catalog[column_name]
+    values = np.asarray(column, dtype=float).copy()
+    values[np.ma.getmaskarray(column)] = np.nan
+    return values
+
+
+def _wise_strings(catalog_wise, column_name):
+    """Return a WISE column as strings, with '--' for missing values."""
+    if column_name not in catalog_wise.colnames:
+        return np.full(len(catalog_wise), '--', dtype='U2')
+
+    column = catalog_wise[column_name]
+    mask = np.ma.getmaskarray(column)
+    values = []
+    for value, is_masked in zip(np.asarray(column, dtype=object), mask):
+        if isinstance(value, bytes):
+            value = value.decode()
+        text = '' if is_masked else str(value).strip()
+        values.append(text or '--')
+    return np.asarray(values)
 
 
 def query_2mass(ra_deg, dec_deg, search_radius=1.0):
@@ -889,11 +1529,15 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
                            dec=catalog_sdss['dec_sdss'],
                            unit='deg')
 
-    # Find matches between the two catalogs
+    # Find matches between the two catalogs, keeping only mutual nearest
+    # neighbours so that two PanSTARRS sources cannot both claim the same SDSS
+    # source and end up sharing its photometry
     idx_sdss, d2d, _ = match_coordinates_sky(coords_psst, coords_sdss)
+    idx_psst, _, _ = match_coordinates_sky(coords_sdss, coords_psst)
+    mutual = idx_psst[idx_sdss] == np.arange(len(coords_psst))
 
     # Create masks for matches within the radius
-    matches = d2d < match_radius_arcsec * u.arcsec
+    matches = (d2d < match_radius_arcsec * u.arcsec) & mutual
 
     # Create a table for matched sources
     matched_sources = table.Table()
@@ -908,8 +1552,12 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
         psst_matched = catalog_psst[psst_indices]
         sdss_matched = catalog_sdss[sdss_indices]
 
-        # Calculate average coordinates
-        ra_matched = (psst_matched['raStack_3pi'] + sdss_matched['ra_sdss']) / 2.0
+        # Calculate average coordinates. Average the offset between the two
+        # positions rather than the two right ascensions, so that a matched
+        # pair straddling RA = 0/360 does not average to 180 degrees.
+        psst_ra = np.array(psst_matched['raStack_3pi'], dtype=float)
+        sdss_ra = np.array(sdss_matched['ra_sdss'], dtype=float)
+        ra_matched = (psst_ra + ((sdss_ra - psst_ra + 180) % 360 - 180) / 2.0) % 360
         dec_matched = (psst_matched['decStack_3pi'] + sdss_matched['dec_sdss']) / 2.0
 
         # Create the matched part of the merged catalog
@@ -918,8 +1566,8 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
         matched_sources['dec_matched'] = dec_matched
 
         # Create masks for unmatched sources
-        unmatched_psst_mask = ~np.in1d(np.arange(len(catalog_psst)), psst_indices)
-        unmatched_sdss_mask = ~np.in1d(np.arange(len(catalog_sdss)), sdss_indices)
+        unmatched_psst_mask = ~np.isin(np.arange(len(catalog_psst)), psst_indices)
+        unmatched_sdss_mask = ~np.isin(np.arange(len(catalog_sdss)), sdss_indices)
 
         # Get unmatched sources
         psst_unmatched = catalog_psst[unmatched_psst_mask]
@@ -997,8 +1645,80 @@ def merge_two_catalogs(catalog_psst, catalog_sdss, match_radius_arcsec=1.5):
     return merged_catalog
 
 
-def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalog=False,
-                catalog_dir='catalogs', save_catalog=True, use_old=True, match_radius_arcsec=1.5):
+def _add_field_catalogs(merged_catalog, ra_deg, dec_deg, search_radius,
+                        match_radius_arcsec, add_wise=False, add_gaia=False,
+                        wise_catalog='unwise', force=False):
+    """Add field-wide WISE and Gaia matches when they are not already saved."""
+    updated = False
+    search_radius_arcsec = search_radius * 60.0
+
+    if add_wise:
+        wise_catalog = wise_catalog.lower()
+        _, required_columns, value_columns = wise_catalog_columns(wise_catalog)
+        existing_wise = (
+            _catalog_meta_value(merged_catalog, 'wise_catalog') == wise_catalog and
+            catalog_match_available(
+                merged_catalog, required_columns, value_columns
+            )
+        )
+        if force or not existing_wise:
+            catalog_wise = query_wise(
+                ra_deg, dec_deg, search_radius=search_radius_arcsec,
+                catalog=wise_catalog
+            )
+            merged_catalog = merge_wise(
+                merged_catalog, catalog_wise,
+                match_radius_arcsec=match_radius_arcsec,
+                catalog=wise_catalog, match_all=True
+            )
+            _set_catalog_meta_value(
+                merged_catalog, 'wise_catalog', wise_catalog
+            )
+            _set_catalog_meta_value(
+                merged_catalog, 'wise_matches', int(np.sum(np.isfinite(
+                    _catalog_floats(merged_catalog, 'separation_wise')
+                )))
+            )
+            updated = True
+        else:
+            print('Using existing field-wide WISE catalog data.')
+
+    if add_gaia:
+        required_columns, value_columns = gaia_catalog_columns()
+        existing_gaia = (
+            _catalog_meta_value(merged_catalog, 'gaia_catalog') == 'gaiadr3' and
+            catalog_match_available(
+                merged_catalog, required_columns, value_columns
+            )
+        )
+        if force or not existing_gaia:
+            catalog_gaia = query_gaia(
+                ra_deg, dec_deg, search_radius=search_radius_arcsec,
+                gaia_limit=-1
+            )
+            merged_catalog = merge_gaia(
+                merged_catalog, catalog_gaia,
+                match_radius_arcsec=match_radius_arcsec, match_all=True
+            )
+            _set_catalog_meta_value(
+                merged_catalog, 'gaia_catalog', 'gaiadr3'
+            )
+            _set_catalog_meta_value(
+                merged_catalog, 'gaia_matches', int(np.sum(np.isfinite(
+                    _catalog_floats(merged_catalog, 'separation_gaia')
+                )))
+            )
+            updated = True
+        else:
+            print('Using existing field-wide Gaia catalog data.')
+
+    return merged_catalog, updated
+
+
+def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0,
+                reimport_catalog=False, catalog_dir='catalogs',
+                save_catalog=True, use_old=True, match_radius_arcsec=1.5,
+                add_wise=False, add_gaia=False, wise_catalog='unwise'):
     """
     Function to query SDSS and PSST catalogs, combine them, clean them, and return the merged catalog.
     Also save the output catalog to the catalog directory.
@@ -1014,7 +1734,7 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
     search_radius : float
         Search radius in arcminutes
     reimport_catalog : bool
-        If True, reimport the catalog from the catalog directory
+        If True, regenerate the optical catalog and enabled field-wide data
     catalog_dir : str
         Directory where the catalog is saved
     save_catalog : bool
@@ -1023,11 +1743,20 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
         If True, use the old version of the query that requires an API key
     match_radius_arcsec : float
         Match radius in arcseconds for merging catalogs
+    add_wise : bool
+        Query WISE across the full field and match every optical catalog row
+    add_gaia : bool
+        Query Gaia across the full field and match every optical catalog row
+    wise_catalog : {'allwise', 'unwise'}
+        WISE catalog used when ``add_wise`` is True
 
     Returns
     -------
     merged_catalog : astropy.table.Table
-        Merged catalog containing data from both SDSS and PSST
+        Merged catalog containing data from both SDSS and PSST. The
+        ``key = value`` header of the saved file records which catalogs and
+        data releases were queried, the search settings, and the number of
+        rows each survey contributed. Use ``get_catalog_meta`` to read it.
     """
 
     # Check if the catalog already exists
@@ -1037,6 +1766,34 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
     if not reimport_catalog and os.path.exists(catalog_path):
         print(f"\nLoading existing catalog from {catalog_path}")
         merged_catalog = table.Table.read(catalog_path, format='ascii')
+
+        # Fill in the basic metadata for catalogs saved by older versions of
+        # FLEET, without overwriting the provenance of the original query
+        existing_meta = get_catalog_meta(merged_catalog)
+        backfill = {
+            'object_name': object_name,
+            'ra_deg': ra_deg,
+            'dec_deg': dec_deg,
+            'search_radius_arcmin': search_radius,
+            'match_radius_arcsec': match_radius_arcsec,
+            'extinction_corrected': False,
+            'panstarrs_catalog': ('unknown' if 'objID_3pi' in
+                                  merged_catalog.colnames else 'none'),
+            'sdss_catalog': ('unknown' if 'objID_sdss' in
+                             merged_catalog.colnames else 'none'),
+        }
+        backfill = {key: value for key, value in backfill.items()
+                    if key not in existing_meta}
+        set_catalog_meta(merged_catalog, backfill)
+
+        merged_catalog, updated = _add_field_catalogs(
+            merged_catalog, ra_deg, dec_deg, search_radius,
+            match_radius_arcsec, add_wise=add_wise, add_gaia=add_gaia,
+            wise_catalog=wise_catalog
+        )
+        if updated and save_catalog:
+            write_catalog(merged_catalog, catalog_path)
+            print(f"Saved enriched catalog to {catalog_path}")
         return merged_catalog
     else:
         print("\nQuerying catalogs...")
@@ -1044,11 +1801,13 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
     # If the catalog does not exist or reimport is requested, query the catalogs
     catalog_sdss = query_sdss(ra_deg, dec_deg, search_radius=search_radius, use_old=use_old)
     catalog_psst = query_panstarrs(ra_deg, dec_deg, search_radius=search_radius, use_old=use_old)
-    if catalog_psst is None:
+    # An empty table is not None, and a survey that found nothing cannot be
+    # cross-matched, so treat it the same way as a survey that was not queried
+    if catalog_psst is None or len(catalog_psst) == 0:
         merged_catalog = catalog_sdss
         merged_catalog['ra_matched'] = catalog_sdss['ra_sdss']
         merged_catalog['dec_matched'] = catalog_sdss['dec_sdss']
-    elif catalog_sdss is None:
+    elif catalog_sdss is None or len(catalog_sdss) == 0:
         merged_catalog = catalog_psst
         merged_catalog['ra_matched'] = catalog_psst['raStack_3pi']
         merged_catalog['dec_matched'] = catalog_psst['decStack_3pi']
@@ -1063,10 +1822,37 @@ def get_catalog(object_name, ra_deg, dec_deg, search_radius=1.0, reimport_catalo
     # Sort the catalog by separation
     merged_catalog.sort('separation')
 
+    # Record where the rows came from and the settings used for the query, so
+    # the saved catalog documents itself
+    set_catalog_meta(merged_catalog, {
+        'fleet_version': fleet_version,
+        'catalog_date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+        'object_name': object_name,
+        'ra_deg': ra_deg,
+        'dec_deg': dec_deg,
+        'search_radius_arcmin': search_radius,
+        'match_radius_arcsec': match_radius_arcsec,
+        # Magnitudes are saved as queried, the extinction correction is
+        # applied later by catalog_operations
+        'extinction_corrected': False,
+        'panstarrs_catalog': _catalog_source_label(catalog_psst, 'panstarrs_catalog'),
+        'panstarrs_query': _catalog_source_label(catalog_psst, 'panstarrs_query'),
+        'panstarrs_rows': 0 if catalog_psst is None else len(catalog_psst),
+        'sdss_catalog': _catalog_source_label(catalog_sdss, 'sdss_catalog'),
+        'sdss_query': _catalog_source_label(catalog_sdss, 'sdss_query'),
+        'sdss_rows': 0 if catalog_sdss is None else len(catalog_sdss),
+    })
+
+    merged_catalog, _ = _add_field_catalogs(
+        merged_catalog, ra_deg, dec_deg, search_radius,
+        match_radius_arcsec, add_wise=add_wise, add_gaia=add_gaia,
+        wise_catalog=wise_catalog, force=reimport_catalog
+    )
+
     # Save the merged catalog to the specified directory
     if save_catalog:
         os.makedirs(catalog_dir, exist_ok=True)
-        merged_catalog.write(catalog_path, format='ascii', overwrite=True)
+        write_catalog(merged_catalog, catalog_path)
         print(f"Saved merged catalog to {catalog_path}")
 
     return merged_catalog
@@ -1104,8 +1890,8 @@ def calc_galaxyness(data_catalog, psf_key, kron_key, classification_catalog=None
         classification_catalog = cached_catalog
 
     # Get PSF and Kron magnitudes for the observed objects
-    target_psfs = np.array(data_catalog[psf_key])
-    target_krons = np.array(data_catalog[kron_key])
+    target_psfs = _catalog_floats(data_catalog, psf_key)
+    target_krons = _catalog_floats(data_catalog, kron_key)
 
     # Replace with nan for PSF mags dimmer than survey limit
     survey_limit = survey_limits[psf_key]
@@ -1215,8 +2001,7 @@ def default_radius(mag, a=196.0, b=0.257, c=-0.27, minimum_halflight=0.7):
     radius : float or array-like
         Half-light radius value in arcsec
     '''
-    radius = a * np.exp(-b * mag) + c
-    radius[radius < minimum_halflight] = minimum_halflight
+    radius = np.clip(a * np.exp(-b * mag) + c, minimum_halflight, None)
     return radius
 
 
@@ -1246,7 +2031,7 @@ def get_halflight(data_catalog, color, host_mag, minimum_halflight=0.7):
         # Get Sersic Index from 3PI
         band_name = f'{color}SerNu_3pi'
         if band_name in data_catalog.colnames:
-            sersic_n = np.copy(data_catalog[band_name])
+            sersic_n = _catalog_floats(data_catalog, band_name)
             # Assume a sersic index of 0.5 if there is none
             sersic_n[np.isnan(sersic_n)] = 0.5
         else:
@@ -1263,11 +2048,13 @@ def get_halflight(data_catalog, color, host_mag, minimum_halflight=0.7):
 
         # Normalize Kron radius to half light radius
         if f'{color}KronRad_3pi' in data_catalog.colnames:
-            halflight_radius = data_catalog[f'{color}KronRad_3pi'] / R_norm
+            halflight_radius = _catalog_floats(data_catalog, f'{color}KronRad_3pi') / R_norm
         else:
             halflight_radius = np.nan * np.ones(len(data_catalog))
     elif f'petroR50_{color}_sdss' in data_catalog.colnames:
-        halflight_radius = data_catalog[f'petroR50_{color}_sdss']
+        # A copy, so that filling the missing values below does not write
+        # straight back into the catalog column
+        halflight_radius = _catalog_floats(data_catalog, f'petroR50_{color}_sdss')
     else:
         halflight_radius = np.nan * np.ones(len(data_catalog))
 
@@ -1314,11 +2101,12 @@ def get_host_mag(data_catalog, band, type='psf', survey=None,
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 host_mag = np.nanmean([data_catalog[f'{band}PSFMag_3pi'], data_catalog[f'psfMag_{band}_sdss']], axis=0)
         elif (f'{band}PSFMag_3pi' in data_catalog.colnames and survey is None) or (survey == '3pi'):
-            # If only PSST exists
-            host_mag = data_catalog[f'{band}PSFMag_3pi']
+            # If only PSST exists. A copy, so that filling the missing values
+            # below does not write straight back into the catalog column
+            host_mag = _catalog_floats(data_catalog, f'{band}PSFMag_3pi')
         elif (f'psfMag_{band}_sdss' in data_catalog.colnames and survey is None) or (survey == 'sdss'):
             # If only SDSS exists
-            host_mag = data_catalog[f'psfMag_{band}_sdss']
+            host_mag = _catalog_floats(data_catalog, f'psfMag_{band}_sdss')
         else:
             # If neither exists, return NaN
             host_mag = np.nan * np.ones(len(data_catalog))
@@ -1330,20 +2118,27 @@ def get_host_mag(data_catalog, band, type='psf', survey=None,
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 host_mag = np.nanmean([data_catalog[f'{band}KronMag_3pi'], data_catalog[f'modelMag_{band}_sdss']], axis=0)
         elif (f'{band}KronMag_3pi' in data_catalog.colnames and survey is None) or (survey == '3pi'):
-            # If only PSST exists
-            host_mag = data_catalog[f'{band}KronMag_3pi']
+            # If only PSST exists. A copy, so that filling the missing values
+            # below does not write straight back into the catalog column
+            host_mag = _catalog_floats(data_catalog, f'{band}KronMag_3pi')
         elif (f'modelMag_{band}_sdss' in data_catalog.colnames and survey is None) or (survey == 'sdss'):
             # If only SDSS exists
-            host_mag = data_catalog[f'modelMag_{band}_sdss']
+            host_mag = _catalog_floats(data_catalog, f'modelMag_{band}_sdss')
         else:
             # If neither exists, return NaN
             host_mag = np.nan * np.ones(len(data_catalog))
-        # Replace the nan values with the PSF magnitude
+        # Replace the nan values with the PSF magnitude. Try each survey in
+        # turn and only fill what is still missing, because the PanSTARRS
+        # columns exist but are entirely nan for SDSS-only rows, which would
+        # otherwise stop the SDSS magnitude from ever being used.
         if impute_values:
-            if f'{band}PSFMag_3pi' in data_catalog.colnames:
-                host_mag[~np.isfinite(host_mag)] = data_catalog[f'{band}PSFMag_3pi'][~np.isfinite(host_mag)]
-            elif f'psfMag_{band}_sdss' in data_catalog.colnames:
-                host_mag[~np.isfinite(host_mag)] = data_catalog[f'psfMag_{band}_sdss'][~np.isfinite(host_mag)]
+            for psf_column in (f'{band}PSFMag_3pi', f'psfMag_{band}_sdss'):
+                if psf_column not in data_catalog.colnames:
+                    continue
+                missing = ~np.isfinite(host_mag)
+                if not np.any(missing):
+                    break
+                host_mag[missing] = _catalog_floats(data_catalog, psf_column)[missing]
     else:
         raise ValueError("Invalid type specified. Use 'psf' or 'kron'.")
 
@@ -1384,7 +2179,7 @@ def calculate_coincidence(separation, size, magnitude):
 
 def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter='i',
                        Pcc_filter_alternative='r', neighbors=20, recalculate_nature=False,
-                       dust_map='SFD', minimum_halflight=0.7):
+                       dust_map='SFD', minimum_halflight=0.7, catalog_dir='catalogs'):
     """
     For all entries in a catalog, calculate and correct for extinction, estimate the nature
     of the object (galaxy vs. star), calculate the separation between the transient ra and dec
@@ -1413,6 +2208,9 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
         Dust map to use for extinction calculation (default is 'SFD')
     minimum_halflight : float
         Default half light radius if none was found (default is 0.7)
+    catalog_dir : str
+        Directory where the catalog is saved, used when the nature of the
+        objects is recalculated (default is 'catalogs')
 
     Returns
     -------
@@ -1459,7 +2257,7 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
 
         # Save nature to input catalog
         merged_catalog['object_nature'] = nature
-        merged_catalog.write(f'catalogs/{object_name}.cat', format='ascii', overwrite=True)
+        write_catalog(merged_catalog, os.path.join(catalog_dir, f'{object_name}.cat'))
 
     # Calculate separations
     if 'separation' not in data_catalog.colnames:
@@ -1655,7 +2453,7 @@ def get_best_host(data_catalog, star_separation=1.0, star_cut=0.1, best_index=No
             best_separation = use_catalog['separation'][best_galaxy]
 
             # Use a step function for the Pcc association to remove very far outliers
-            if (best_separation > 8) & (best_pcc > pcc_pcc_threshold):
+            if (best_separation > pcc_distance_threshold) & (best_pcc > pcc_pcc_threshold):
                 close_galaxies = use_catalog[use_catalog['separation'] <= pcc_distance_threshold]
                 if len(close_galaxies) > 0:
                     # If there are close galaxies, pick the one with the lowest Pcc
@@ -1690,10 +2488,28 @@ def get_best_host(data_catalog, star_separation=1.0, star_cut=0.1, best_index=No
         host_magnitude_g = data_catalog['host_magnitude_g'][best_host]
         host_magnitude_r = data_catalog['host_magnitude_r'][best_host]
         host_nature = data_catalog['object_nature'][best_host]
-        photoz = data_catalog['photoz'][best_host] if 'photoz' in data_catalog.colnames else None
-        photoz_err = data_catalog['photoz_err'][best_host] if 'photoz_err' in data_catalog.colnames else None
-        specz = data_catalog['specz'][best_host] if 'specz' in data_catalog.colnames else None
-        specz_err = data_catalog['specz_err'][best_host] if 'specz_err' in data_catalog.colnames else None
+
+        # The redshift columns from SDSS carry the survey suffix, e.g. photoz_sdss
+        def host_redshift(column_names):
+            """Return the first finite value found among these columns."""
+            for column_name in column_names:
+                if column_name not in data_catalog.colnames:
+                    continue
+                value = data_catalog[column_name][best_host]
+                if np.ma.is_masked(value):
+                    continue
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    return value
+            return None
+
+        photoz = host_redshift(['photoz', 'photoz_sdss'])
+        photoz_err = host_redshift(['photoz_err', 'photozErr_sdss'])
+        specz = host_redshift(['specz', 'specz_sdss'])
+        specz_err = host_redshift(['specz_err', 'speczErr_sdss'])
 
     return (host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude, host_magnitude_g, host_magnitude_r,
             host_nature, photoz, photoz_err, specz, specz_err, best_host, force_detection)

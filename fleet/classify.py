@@ -1,6 +1,11 @@
 from .transient import get_transient_info, process_lightcurve
 from .model import fit_data
-from .catalog import get_catalog, catalog_operations, overwrite_with_glade, get_best_host, host_limit
+from .catalog import (get_catalog, catalog_operations, overwrite_with_glade,
+                      get_best_host, host_limit, query_wise, merge_wise,
+                      query_gaia, merge_gaia, write_catalog,
+                      catalog_match_available, wise_catalog_columns,
+                      gaia_catalog_columns, clear_catalog_field_marker,
+                      add_host_metadata)
 from .plot import make_plot, calculate_observability, calc_absmag, quick_plot
 import pkg_resources
 import multiprocessing
@@ -600,8 +605,8 @@ def create_info_table(parameters, output_table, data_catalog, **kwargs):
     # Calculate the number of sources in the catalog, and whether there is SDSS and PSST data
     if data_catalog:
         num_sources = len(data_catalog)
-        has_sdss = 'gPSFMag_3pi' in data_catalog.columns
-        has_psst = 'psfMag_g_sdss' in data_catalog.columns
+        has_sdss = 'psfMag_g_sdss' in data_catalog.columns
+        has_psst = 'gPSFMag_3pi' in data_catalog.columns
         info_table['num_sources'] = num_sources
         info_table['has_sdss'] = has_sdss
         info_table['has_psst'] = has_psst
@@ -715,7 +720,9 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
             star_cut=0.1, save_params=True, params_dir='parameters', classifier='all', plot_output=True, plot_dir='plots',
             do_observability=True, include_het=False, pupil_fraction=0.3, minimum_halflight=0.7, classify=True, ztf_dir='ztf', rubin_dir='rubin',
             match_radius_arcsec=1.5, pcc_pcc_threshold=0.02, pcc_distance_threshold=8, n_sigma_limit=3, emcee_progress=True,
-            running_live=False, osc_dir='osc', local_dir='photometry'):
+            running_live=False, osc_dir='osc', local_dir='photometry', download_forced=False, include_forced=False,
+            add_wise=False, add_gaia=False, small_wise=False, small_gaia=False,
+            host_search_radius=5.0, wise_catalog='unwise'):
     """
     Predicts the classification of an object based on its name, right ascension, and declination.
 
@@ -752,7 +759,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     lc_dir : str, optional
         The directory to save the light curve data. Default is 'lightcurves'.
     read_existing : bool, optional
-        Whether to read existing light curve data instead of downloading. Default is False.
+        Whether to read existing light curve data instead of downloading. If the light curve
+        file already exists in lc_dir, ZTF and Rubin are not queried at all. Default is False.
     clean_ignore : bool, optional
         Whether to clean the light curve data by ignoring certain observations. Default is True.
     dust_map : str, optional
@@ -792,7 +800,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     search_radius : float, optional
         The search radius in arcminutes for finding host galaxies. Default is 1.0.
     reimport_catalog : bool, optional
-        Whether to reimport the galaxy catalog. Default is False.
+        Whether to regenerate the galaxy catalog. This also refreshes enabled
+        WISE and Gaia data. Default is False.
     catalog_dir : str, optional
         The directory to save the galaxy catalog. Default is 'catalogs'.
     save_catalog : bool, optional
@@ -848,7 +857,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     rubin_dir : str, optional
         The directory to save the Rubin data. Default is 'rubin'.
     match_radius_arcsec : float, optional
-        The radius in arcseconds to match the transient object with the host galaxy. Default is 1.5.
+        The radius in arcseconds used for optical, WISE, and Gaia catalog
+        matching. Default is 1.5.
     pcc_pcc_threshold : float, optional
         The PCC threshold to use for host galaxy classification. Default is 0.02.
     pcc_distance_threshold : float, optional
@@ -863,6 +873,30 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         The directory to save the OSC data. Default is 'osc'.
     local_dir : str, optional
         The directory to save the local photometry data. Default is 'photometry'.
+    download_forced : bool, optional
+        Whether to download the ZTF and Rubin forced photometry from Alerce and
+        save it to the light curve files with Source = 'Alerce-forced'. Default is False.
+    include_forced : bool, optional
+        Whether to actually use the forced photometry when fitting and classifying.
+        If False, any forced photometry is kept in the saved light curve files but
+        removed before FLEET uses the light curve. Default is False.
+    add_wise : bool, optional
+        Query WISE across the full optical-catalog field and match every row.
+        Default is False.
+    add_gaia : bool, optional
+        Query Gaia across the full optical-catalog field and match every row.
+        Default is False.
+    small_wise : bool, optional
+        Query WISE only around the selected best host and enrich that row.
+        Ignored when ``add_wise`` is True. Default is False.
+    small_gaia : bool, optional
+        Query Gaia only around the selected best host and enrich that row.
+        Ignored when ``add_gaia`` is True. Default is False.
+    host_search_radius : float, optional
+        Cone radius in arcseconds for ``small_wise`` and ``small_gaia``.
+        Default is 5.0.
+    wise_catalog : {'allwise', 'unwise'}, optional
+        WISE catalog to query. Default is ``unwise``.
 
     Returns
     -------
@@ -882,7 +916,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         get_transient_info(object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in, object_class_in=object_class_in, redshift_in=redshift_in,
                            acceptance_radius=acceptance_radius, save_ztf=save_ztf, download_ztf=download_ztf,
                            download_osc=download_osc, save_rubin=save_rubin, download_rubin=download_rubin, read_local=read_local,
-                           query_tns=query_tns, ztf_dir=ztf_dir, rubin_dir=rubin_dir, lc_dir=lc_dir, osc_dir=osc_dir, local_dir=local_dir)
+                           query_tns=query_tns, ztf_dir=ztf_dir, rubin_dir=rubin_dir, lc_dir=lc_dir, osc_dir=osc_dir, local_dir=local_dir,
+                           download_forced=download_forced, read_existing=read_existing)
     print('\nPredicting:', object_name)
 
     if save_params:
@@ -909,7 +944,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     ####################
     input_table = process_lightcurve(object_name, ra_deg=ra_deg, dec_deg=dec_deg, ztf_data=ztf_data, rubin_data=rubin_data,
                                      osc_data=osc_data, local_data=local_data, save_lc=save_lc, lc_dir=lc_dir,
-                                     read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map)
+                                     read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
+                                     include_forced=include_forced)
 
     # Stop if it failed
     if input_table is None:
@@ -952,7 +988,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
         # Create quick info table
         info_table = create_info_table(parameters, output_table, data_catalog=None, object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
                                        object_class_in=object_class_in, redshift_in=redshift_in, acceptance_radius=acceptance_radius, save_ztf=save_ztf,
-                                       download_ztf=download_ztf, download_osc=download_osc, download_rubin=download_rubin, save_rubin=save_rubin, read_local=read_local,
+                                       download_ztf=download_ztf, download_osc=download_osc, download_rubin=download_rubin, save_rubin=save_rubin,
+                                       download_forced=download_forced, include_forced=include_forced, read_local=read_local,
                                        query_tns=query_tns, save_lc=save_lc, read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
                                        phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps, n_cores=n_cores,
                                        model=model, late_phase=late_phase, default_err=default_err, default_decline_g=default_decline_g,
@@ -966,7 +1003,8 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                        dec_deg=dec_deg, transient_source=transient_source, object_name=object_name, ztf_name=ztf_name,
                                        rubin_name=rubin_name, tns_name=tns_name, object_class=object_class, redshift=redshift, color_peak=color_peak,
                                        late_color=late_color, late_color10=late_color10, late_color20=late_color20, late_color40=late_color40,
-                                       late_color60=late_color60, first_to_peak_r=first_to_peak_r, first_to_peak_g=first_to_peak_g, peak_to_last_r=peak_to_last_r,
+                                       late_color60=late_color60, first_to_peak_r=first_to_peak_r,
+                                       first_to_peak_g=first_to_peak_g, peak_to_last_r=peak_to_last_r,
                                        peak_to_last_g=peak_to_last_g, bright_mjd=bright_mjd, first_mjd=first_mjd, brightest_mag=brightest_mag,
                                        green_brightest=green_brightest, red_brightest=red_brightest, chi2=chi2, save_params=save_params, classifier=classifier,
                                        plot_output=plot_output, do_observability=do_observability, classify=classify,
@@ -992,18 +1030,32 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     ######################
     merged_catalog = get_catalog(object_name, ra_deg, dec_deg, search_radius=search_radius, reimport_catalog=reimport_catalog,
                                  catalog_dir=catalog_dir, save_catalog=save_catalog, use_old=use_old,
-                                 match_radius_arcsec=match_radius_arcsec)
+                                 match_radius_arcsec=match_radius_arcsec,
+                                 add_wise=add_wise, add_gaia=add_gaia,
+                                 wise_catalog=wise_catalog)
 
     data_catalog = catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=Pcc_filter,
                                       Pcc_filter_alternative=Pcc_filter_alternative, neighbors=neighbors,
                                       recalculate_nature=recalculate_nature, dust_map=dust_map,
-                                      minimum_halflight=minimum_halflight)
+                                      minimum_halflight=minimum_halflight, catalog_dir=catalog_dir)
+
+    # Keep track of where the host came from, to save it in the catalog header
+    input_best_index = best_index
+    glade_index = None
 
     # Overwrite with GLADE if specified
     if use_glade:
         best_index = overwrite_with_glade(ra_deg, dec_deg, object_name, data_catalog,
                                           max_separation_glade=max_separation_glade, dimmest_glade=dimmest_glade,
                                           max_pcc_glade=max_pcc_glade, max_distance_glade=max_distance_glade)
+        glade_index = best_index
+
+    if glade_index is not None:
+        best_host_source = 'glade'
+    elif input_best_index is not None and best_index is not None:
+        best_host_source = 'input'
+    else:
+        best_host_source = 'chance_coincidence'
 
     (host_radius, host_separation, host_ra, host_dec, host_Pcc, host_magnitude,
      host_magnitude_g, host_magnitude_r, host_nature, photoz, photoz_err, specz,
@@ -1011,6 +1063,95 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                                             star_cut=star_cut, best_index=best_index,
                                                             pcc_pcc_threshold=pcc_pcc_threshold,
                                                             pcc_distance_threshold=pcc_distance_threshold)
+
+    # A full-field query already includes the best host, so it takes
+    # precedence if both modes were requested for the same service.
+    run_small_wise = small_wise and not add_wise
+    run_small_gaia = small_gaia and not add_gaia
+    if small_wise and add_wise:
+        print('Skipping small WISE query because add_wise is enabled.')
+    if small_gaia and add_gaia:
+        print('Skipping small Gaia query because add_gaia is enabled.')
+
+    # Query WISE and Gaia only around the selected host, then append the
+    # results to that one row in both the working and saved catalogs.
+    if run_small_wise or run_small_gaia:
+        valid_host = best_host is not None and 0 <= int(best_host) < len(data_catalog)
+        if valid_host:
+            host_query_ra = float(data_catalog['ra_matched'][best_host])
+            host_query_dec = float(data_catalog['dec_matched'][best_host])
+            valid_host = np.isfinite(host_query_ra) and np.isfinite(host_query_dec)
+
+        if not valid_host:
+            print('No best host; skipping requested host-catalog queries.')
+
+        updated_suffixes = []
+        if run_small_wise:
+            wise_catalog = wise_catalog.lower()
+            _, required_wise_columns, wise_value_columns = wise_catalog_columns(
+                wise_catalog
+            )
+            query_wise_needed = reimport_catalog or not catalog_match_available(
+                data_catalog, required_wise_columns, wise_value_columns,
+                row_index=best_host if valid_host else None
+            )
+
+            if query_wise_needed:
+                catalog_wise = None
+                if valid_host:
+                    catalog_wise = query_wise(
+                        host_query_ra, host_query_dec,
+                        search_radius=host_search_radius,
+                        catalog=wise_catalog
+                    )
+                data_catalog = merge_wise(
+                    data_catalog, catalog_wise,
+                    host_index=best_host if valid_host else None,
+                    match_radius_arcsec=match_radius_arcsec,
+                    catalog=wise_catalog
+                )
+                clear_catalog_field_marker(data_catalog, 'wise')
+                clear_catalog_field_marker(merged_catalog, 'wise')
+                updated_suffixes.append('_wise')
+            else:
+                print('Using existing WISE catalog data.')
+
+        if run_small_gaia:
+            required_gaia_columns, gaia_value_columns = gaia_catalog_columns()
+            query_gaia_needed = reimport_catalog or not catalog_match_available(
+                data_catalog, required_gaia_columns, gaia_value_columns,
+                row_index=best_host if valid_host else None
+            )
+
+            if query_gaia_needed:
+                catalog_gaia = None
+                if valid_host:
+                    catalog_gaia = query_gaia(
+                        host_query_ra, host_query_dec,
+                        search_radius=host_search_radius
+                    )
+                data_catalog = merge_gaia(
+                    data_catalog, catalog_gaia,
+                    host_index=best_host if valid_host else None,
+                    match_radius_arcsec=match_radius_arcsec
+                )
+                clear_catalog_field_marker(data_catalog, 'gaia')
+                clear_catalog_field_marker(merged_catalog, 'gaia')
+                updated_suffixes.append('_gaia')
+            else:
+                print('Using existing Gaia catalog data.')
+
+        if updated_suffixes:
+            for column_name in data_catalog.colnames:
+                if any(column_name.endswith(suffix)
+                       for suffix in updated_suffixes):
+                    merged_catalog[column_name] = data_catalog[column_name].copy()
+
+            if save_catalog:
+                os.makedirs(catalog_dir, exist_ok=True)
+                catalog_path = os.path.join(catalog_dir, f'{object_name}.cat')
+                write_catalog(merged_catalog, catalog_path)
+                print(f'Saved enriched catalog to {catalog_path}')
 
     # Get the nearest host galaxy
     closest = np.nanargmin(data_catalog['separation'])
@@ -1028,6 +1169,7 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
     info_table = create_info_table(parameters, output_table, data_catalog, object_name_in=object_name_in, ra_in=ra_in, dec_in=dec_in,
                                    object_class_in=object_class_in, redshift_in=redshift_in, acceptance_radius=acceptance_radius, save_ztf=save_ztf,
                                    save_rubin=save_rubin, download_ztf=download_ztf, download_rubin=download_rubin,
+                                   download_forced=download_forced, include_forced=include_forced,
                                    download_osc=download_osc, read_local=read_local, query_tns=query_tns, save_lc=save_lc,
                                    read_existing=read_existing, clean_ignore=clean_ignore, dust_map=dust_map,
                                    phase_min=phase_min, phase_max=phase_max, n_walkers=n_walkers, n_steps=n_steps, n_cores=n_cores,
@@ -1055,6 +1197,25 @@ def predict(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, 
                                    classify=classify, include_het=include_het, pupil_fraction=pupil_fraction, minimum_halflight=minimum_halflight,
                                    match_radius_arcsec=match_radius_arcsec, pcc_pcc_threshold=pcc_pcc_threshold,
                                    pcc_distance_threshold=pcc_distance_threshold, n_sigma_limit=n_sigma_limit)
+
+    #############################
+    # Save the catalog metadata #
+    #############################
+    # Record which row was selected as the host in the header of the catalog,
+    # so the choice can be traced from the saved file
+    if 'hostless' in info_table.colnames:
+        hostless = info_table['hostless'][0]
+    else:
+        hostless = None
+
+    add_host_metadata(merged_catalog, data_catalog, best_host=best_host, closest=closest,
+                      best_host_source=best_host_source, force_detection=force_detection,
+                      hostless=hostless)
+
+    if save_catalog:
+        catalog_path = os.path.join(catalog_dir, f'{object_name}.cat')
+        write_catalog(merged_catalog, catalog_path)
+        print(f'\nSaved catalog metadata to {catalog_path}')
 
     ##################
     # Classification #

@@ -2,6 +2,8 @@
 numpy
 scipy
 astropy
+astroquery
+pyvo>=1.9
 matplotlib
 corner
 requests

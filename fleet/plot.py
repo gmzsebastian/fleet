@@ -1,5 +1,6 @@
 from .model import linex, model_mag, get_filter_wavelengths
-from .catalog import sdss_refs, psst_refs, calc_separations
+from .catalog import (sdss_refs, psst_refs, wise_refs, gaia_refs,
+                      gaia_AB_offsets, calc_separations)
 import glob
 from astropy import table
 from matplotlib.pyplot import cm
@@ -132,16 +133,19 @@ def photometry_source_indices(sources, telescopes=None):
     else:
         telescopes = np.char.lower(np.char.strip(np.asarray(telescopes, dtype=str)))
 
-    is_rubin = np.isin(telescopes, ['rubin', 'lsst']) | np.isin(sources, ['rubin', 'lsst'])
-    is_ztf = (np.isin(telescopes, ['ztf']) | np.isin(sources, ['ztf', 'alerce'])) & ~is_rubin
-    is_local = np.isin(sources, ['local', 'flwo'])
-    is_other = ~(is_rubin | is_ztf | is_local)
+    # Forced photometry is flagged with a Source ending in 'forced', e.g. 'Alerce-forced'
+    is_forced = np.char.endswith(sources, 'forced')
+    is_rubin = (np.isin(telescopes, ['rubin', 'lsst']) | np.isin(sources, ['rubin', 'lsst'])) & ~is_forced
+    is_ztf = (np.isin(telescopes, ['ztf']) | np.isin(sources, ['ztf', 'alerce'])) & ~is_rubin & ~is_forced
+    is_local = np.isin(sources, ['local', 'flwo']) & ~is_forced
+    is_other = ~(is_rubin | is_ztf | is_local | is_forced)
 
     return {
         'ztf': np.flatnonzero(is_ztf),
         'rubin': np.flatnonzero(is_rubin),
         'local': np.flatnonzero(is_local),
         'other': np.flatnonzero(is_other),
+        'forced': np.flatnonzero(is_forced),
     }
 
 
@@ -1253,6 +1257,7 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
     is_det_rubin = det_groups['rubin']
     is_det_local = det_groups['local']
     is_det_other = det_groups['other']
+    is_det_forced = det_groups['forced']
 
     # Set plot limits to ± 0.5 the magnitude limits
     if full_range:
@@ -1298,19 +1303,23 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
     plt.errorbar(all_phases[detection][is_det_ztf], all_magnitudes[detection][is_det_ztf], all_sigmas[detection][is_det_ztf],
                  ecolor=all_colors[detection][is_det_ztf], fmt='d', alpha=0.8, ms=0)
     plt.errorbar(all_phases[detection][is_det_rubin], all_magnitudes[detection][is_det_rubin], all_sigmas[detection][is_det_rubin],
-                 ecolor=all_colors[detection][is_det_rubin], fmt='s', alpha=0.8, ms=0)
+                 ecolor=all_colors[detection][is_det_rubin], fmt='o', alpha=0.8, ms=0)
     plt.errorbar(all_phases[detection][is_det_local], all_magnitudes[detection][is_det_local], all_sigmas[detection][is_det_local],
                  ecolor=all_colors[detection][is_det_local], fmt='*', alpha=0.8, ms=0)
     plt.errorbar(all_phases[detection][is_det_other], all_magnitudes[detection][is_det_other], all_sigmas[detection][is_det_other],
                  ecolor=all_colors[detection][is_det_other], fmt='.', alpha=0.8, ms=0)
+    plt.errorbar(all_phases[detection][is_det_forced], all_magnitudes[detection][is_det_forced], all_sigmas[detection][is_det_forced],
+                 ecolor=all_colors[detection][is_det_forced], fmt='s', alpha=0.8, ms=0)
     plt.scatter(all_phases[detection][is_det_ztf], all_magnitudes[detection][is_det_ztf],
                 color=all_colors[detection][is_det_ztf], marker='d', alpha=0.8, s=90)
     plt.scatter(all_phases[detection][is_det_rubin], all_magnitudes[detection][is_det_rubin],
-                color=all_colors[detection][is_det_rubin], marker='s', alpha=0.8, s=90)
+                color=all_colors[detection][is_det_rubin], marker='o', alpha=0.8, s=90)
     plt.scatter(all_phases[detection][is_det_local], all_magnitudes[detection][is_det_local],
                 color=all_colors[detection][is_det_local], marker='*', alpha=0.8, s=90)
     plt.scatter(all_phases[detection][is_det_other], all_magnitudes[detection][is_det_other],
                 color=all_colors[detection][is_det_other], marker='.', alpha=0.8, s=90)
+    plt.scatter(all_phases[detection][is_det_forced], all_magnitudes[detection][is_det_forced],
+                color=all_colors[detection][is_det_forced], marker='s', alpha=0.8, s=90)
 
     # Plot upper limits
     ul_alpha = 0.5
@@ -1325,24 +1334,29 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
     was_det_rubin = ignored_groups['rubin']
     was_det_local = ignored_groups['local']
     was_det_other = ignored_groups['other']
+    was_det_forced = ignored_groups['forced']
 
     # Plot ignored detections
     plt.errorbar(all_phases[detect_ignore][was_det_ztf], all_magnitudes[detect_ignore][was_det_ztf], all_sigmas[detect_ignore][was_det_ztf],
                  ecolor=all_colors[detect_ignore][was_det_ztf], fmt='d', alpha=ignore_alpha, ms=0)
     plt.errorbar(all_phases[detect_ignore][was_det_rubin], all_magnitudes[detect_ignore][was_det_rubin], all_sigmas[detect_ignore][was_det_rubin],
-                 ecolor=all_colors[detect_ignore][was_det_rubin], fmt='s', alpha=ignore_alpha, ms=0)
+                 ecolor=all_colors[detect_ignore][was_det_rubin], fmt='o', alpha=ignore_alpha, ms=0)
     plt.errorbar(all_phases[detect_ignore][was_det_local], all_magnitudes[detect_ignore][was_det_local], all_sigmas[detect_ignore][was_det_local],
                  ecolor=all_colors[detect_ignore][was_det_local], fmt='*', alpha=ignore_alpha, ms=0)
     plt.errorbar(all_phases[detect_ignore][was_det_other], all_magnitudes[detect_ignore][was_det_other], all_sigmas[detect_ignore][was_det_other],
                  ecolor=all_colors[detect_ignore][was_det_other], fmt='.', alpha=ignore_alpha, ms=0)
+    plt.errorbar(all_phases[detect_ignore][was_det_forced], all_magnitudes[detect_ignore][was_det_forced], all_sigmas[detect_ignore][was_det_forced],
+                 ecolor=all_colors[detect_ignore][was_det_forced], fmt='s', alpha=ignore_alpha, ms=0)
     plt.scatter(all_phases[detect_ignore][was_det_ztf], all_magnitudes[detect_ignore][was_det_ztf],
                 color=all_colors[detect_ignore][was_det_ztf], marker='d', alpha=ignore_alpha, s=90)
     plt.scatter(all_phases[detect_ignore][was_det_rubin], all_magnitudes[detect_ignore][was_det_rubin],
-                color=all_colors[detect_ignore][was_det_rubin], marker='s', alpha=ignore_alpha, s=90)
+                color=all_colors[detect_ignore][was_det_rubin], marker='o', alpha=ignore_alpha, s=90)
     plt.scatter(all_phases[detect_ignore][was_det_local], all_magnitudes[detect_ignore][was_det_local],
                 color=all_colors[detect_ignore][was_det_local], marker='*', alpha=ignore_alpha, s=90)
     plt.scatter(all_phases[detect_ignore][was_det_other], all_magnitudes[detect_ignore][was_det_other],
                 color=all_colors[detect_ignore][was_det_other], marker='.', alpha=ignore_alpha, s=90)
+    plt.scatter(all_phases[detect_ignore][was_det_forced], all_magnitudes[detect_ignore][was_det_forced],
+                color=all_colors[detect_ignore][was_det_forced], marker='s', alpha=ignore_alpha, s=90)
 
     # Plot ignored upper limits
     plt.scatter(all_phases[upper_ignore], all_magnitudes[upper_ignore],
@@ -1370,6 +1384,8 @@ def plot_lightcurve(sub_y, sub_x, sub_n, input_table, info_table, subtract_phase
         used_sources.append('Local')
     if len(all_groups['other']) > 0:
         used_sources.append('Other')
+    if len(all_groups['forced']) > 0:
+        used_sources.append('Forced')
 
     wavelengths = get_filter_wavelengths(used_filters, input_table)
 
@@ -1484,7 +1500,7 @@ def plot_host_sed(sub_y, sub_x, sub_n, data_catalog, info_table):
         flux = 10 ** (-0.4 * magnitudes) * Jy.value * 1000
         flux_err = flux * (10 ** (0.4 * errors) - 1)
 
-        plt.errorbar(wavelengths, flux, flux_err, fmt='o', color='c', alpha=0.7, label='3PI')
+        plt.errorbar(wavelengths, flux, flux_err, fmt='o', color='green', alpha=0.7, label='3PI')
     if 'modelMag_g_sdss' in data_catalog.colnames:
         # Get the data for the best host
         magnitudes = np.array([data_catalog[best_host]['modelMag_u_sdss'],
@@ -1501,12 +1517,82 @@ def plot_host_sed(sub_y, sub_x, sub_n, data_catalog, info_table):
         flux = 10 ** (-0.4 * magnitudes) * Jy.value * 1000
         flux_err = flux * (10 ** (0.4 * errors) - 1)
 
-        plt.errorbar(wavelengths, flux, flux_err, fmt='o', color='orange', alpha=0.7, label='SDSS')
+        plt.errorbar(wavelengths, flux, flux_err, fmt='o', color='red', alpha=0.7, label='SDSS')
+
+    # WISE magnitudes are stored in AB, so use the same flux conversion as
+    # the optical catalogs. Upper limits are shown separately from detections.
+    wise_bands = [
+        band for band in wise_refs
+        if f'{band}_AB_wise' in data_catalog.colnames
+    ]
+    has_wise = False
+    wise_max_wavelength = 13000
+    if wise_bands:
+        magnitudes = np.array([
+            data_catalog[best_host][f'{band}_AB_wise']
+            for band in wise_bands
+        ], dtype=float)
+        errors = np.array([
+            data_catalog[best_host][f'{band}_AB_err_wise']
+            for band in wise_bands
+        ], dtype=float)
+        wavelengths = np.array([wise_refs[band] for band in wise_bands])
+        limits = np.array([
+            str(data_catalog[best_host][f'{band}_limit_wise']).lower() == 'true'
+            for band in wise_bands
+        ])
+        finite = np.isfinite(magnitudes)
+        detections = finite & ~limits
+        upper_limits = finite & limits
+        flux = 10 ** (-0.4 * magnitudes) * Jy.value * 1000
+        flux_err = flux * (10 ** (0.4 * errors) - 1)
+
+        if np.any(detections):
+            detection_errors = np.where(
+                np.isfinite(flux_err[detections]), flux_err[detections], 0
+            )
+            plt.errorbar(wavelengths[detections], flux[detections],
+                         detection_errors, fmt='s', color='m', alpha=0.7,
+                         label='WISE')
+        if np.any(upper_limits):
+            plt.scatter(wavelengths[upper_limits], flux[upper_limits],
+                        marker='v', color='m', alpha=0.7,
+                        label='WISE upper limit')
+        has_wise = np.any(finite)
+        if has_wise:
+            wise_max_wavelength = np.max(wavelengths[finite])
+
+    # Gaia catalog magnitudes use the Vega system. Convert them to AB before
+    # applying the same flux conversion used by SDSS, 3PI, and WISE.
+    gaia_bands = {
+        'BP': 'phot_bp_mean_mag_gaia',
+        'G': 'phot_g_mean_mag_gaia',
+        'RP': 'phot_rp_mean_mag_gaia',
+    }
+    if all(column in data_catalog.colnames for column in gaia_bands.values()):
+        magnitudes = np.array([
+            data_catalog[best_host][column]
+            for column in gaia_bands.values()
+        ], dtype=float)
+        magnitudes += np.array([
+            gaia_AB_offsets[band] for band in gaia_bands
+        ])
+        wavelengths = np.array([gaia_refs[band] for band in gaia_bands])
+        finite = np.isfinite(magnitudes)
+        flux = 10 ** (-0.4 * magnitudes) * Jy.value * 1000
+        if np.any(finite):
+            plt.scatter(wavelengths[finite], flux[finite], marker='D',
+                        color='orange', alpha=0.7, label='Gaia')
 
     # Setup plot
     plt.legend(loc='upper right')
     plt.title('Best Host SED')
-    plt.xlim(2500, 13000)
+    if has_wise:
+        plt.xscale('log')
+        plt.xlim(2500, max(13000, wise_max_wavelength * 1.2))
+    else:
+        plt.xscale('linear')
+        plt.xlim(2500, 13000)
     plt.ylim(ymin=0)
     plt.xlabel('Wavelength [\u212b]')
     plt.ylabel('Flux [mJy]')
@@ -1562,6 +1648,28 @@ def plot_coordinates(sub_y, sub_x, sub_n, data_catalog, info_table, acceptance_b
     if 'ra_sdss' in data_catalog.colnames:
         delta_ra_sdss, delta_dec_sdss = calc_separations(data_catalog['ra_sdss'], data_catalog['dec_sdss'], closest_ra, closest_dec, separate=True)
         plt.scatter(delta_ra_sdss, delta_dec_sdss, marker='o', color='r', alpha=0.5, label='SDSS')
+    if {'ra_wise', 'dec_wise'}.issubset(data_catalog.colnames):
+        wise_ra = np.asarray(data_catalog['ra_wise'], dtype=float)
+        wise_dec = np.asarray(data_catalog['dec_wise'], dtype=float)
+        finite = np.isfinite(wise_ra) & np.isfinite(wise_dec)
+        if np.any(finite):
+            delta_ra_wise, delta_dec_wise = calc_separations(
+                wise_ra[finite], wise_dec[finite], closest_ra, closest_dec,
+                separate=True
+            )
+            plt.scatter(delta_ra_wise, delta_dec_wise, marker='s', color='m',
+                        alpha=0.5, label='WISE')
+    if {'ra_gaia', 'dec_gaia'}.issubset(data_catalog.colnames):
+        gaia_ra = np.asarray(data_catalog['ra_gaia'], dtype=float)
+        gaia_dec = np.asarray(data_catalog['dec_gaia'], dtype=float)
+        finite = np.isfinite(gaia_ra) & np.isfinite(gaia_dec)
+        if np.any(finite):
+            delta_ra_gaia, delta_dec_gaia = calc_separations(
+                gaia_ra[finite], gaia_dec[finite], closest_ra, closest_dec,
+                separate=True
+            )
+            plt.scatter(delta_ra_gaia, delta_dec_gaia, marker='D',
+                        color='orange', alpha=0.5, label='Gaia')
 
     # Set limits
     plt.legend(loc='best')
@@ -1599,17 +1707,20 @@ def plot_legend(sub_y, sub_x, sub_n, used_filters, used_sources):
     is_det_ztf = np.flatnonzero(np.isin(used_sources, ['ZTF', 'Alerce']))
     is_det_rubin = np.flatnonzero(np.isin(used_sources, ['Rubin', 'LSST']))
     is_det_local = np.flatnonzero(np.isin(used_sources, ['Local', 'FLWO']))
-    is_det_other = np.where(~np.isin(used_sources, ['ZTF', 'Alerce', 'Rubin', 'LSST', 'Local', 'FLWO']))[0]
+    is_det_forced = np.flatnonzero(np.isin(used_sources, ['Forced']))
+    is_det_other = np.where(~np.isin(used_sources, ['ZTF', 'Alerce', 'Rubin', 'LSST', 'Local', 'FLWO', 'Forced']))[0]
 
     plt.subplot(sub_y, sub_x, sub_n)
     if len(is_det_ztf) > 0:
         plt.scatter([], [], marker='d', alpha=1.0, s=90, color='k', label='ZTF')
     if len(is_det_rubin) > 0:
-        plt.scatter([], [], marker='s', alpha=1.0, s=90, color='k', label='Rubin')
+        plt.scatter([], [], marker='o', alpha=1.0, s=90, color='k', label='Rubin')
     if len(is_det_local) > 0:
         plt.scatter([], [], marker='*', alpha=1.0, s=90, color='k', label='Local')
     if len(is_det_other) > 0:
-        plt.scatter([], [], marker='o', alpha=1.0, s=90, color='k', label='Other')
+        plt.scatter([], [], marker='.', alpha=1.0, s=90, color='k', label='Other')
+    if len(is_det_forced) > 0:
+        plt.scatter([], [], marker='s', alpha=1.0, s=90, color='k', label='Forced')
 
     for i in range(len(used_filters)):
         plt.scatter([], [], marker='o', alpha=1.0, s=90, color=all_colors[i], label=used_filters[i])

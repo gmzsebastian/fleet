@@ -1,3 +1,13 @@
+3.2 (2026-10-09)
+----------------
+
+- Added forced photometry support.
+- Added WISE queries (off by default) and an option to always query WISE and Gaia.
+- Gaia DR4 bug fixes and updated WISE query.
+- Plot WISE and Gaia data.
+- Catalog metadata, empty-query, and light-curve re-run bug fixes.
+- Added Dockerfile and GHCR image publishing workflow (M. Coughlin).
+
 3.1 (2026-05-09)
 ----------------
 

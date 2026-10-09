@@ -294,7 +294,258 @@ def get_ztf_coords(ztf_name):
         return None, None
 
 
-def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf', download_ztf=True):
+def remove_forced(input_table):
+    """
+    Remove forced photometry rows from a light curve table. Forced photometry
+    is flagged in the 'Source' column with names ending in 'forced', e.g.
+    'Alerce-forced'.
+
+    Parameters
+    ----------
+    input_table : astropy.table.Table
+        Light curve table with a 'Source' column
+
+    Returns
+    -------
+    input_table : astropy.table.Table
+        The same table without any forced photometry rows
+    """
+
+    if input_table is None or len(input_table) == 0 or 'Source' not in input_table.colnames:
+        return input_table
+
+    is_forced = np.array([str(source).strip().lower().endswith('forced') for source in input_table['Source']])
+    if np.any(is_forced):
+        print(f'Ignoring {int(np.sum(is_forced))} forced photometry points ...')
+
+    return input_table[~is_forced]
+
+
+def get_ztf_forced(ztf_name, max_magerr=1.0, reject_negative=False):
+    """
+    Query the Alerce database to get the forced photometry of a ZTF object.
+    The output has the same format as get_ztf_lightcurve, but the 'Source'
+    column is set to 'Alerce-forced' so these points can be told apart from
+    the regular alert photometry.
+
+    Parameters
+    ----------
+    ztf_name : str
+        The ZTF object name to query
+    max_magerr : float, optional
+        Reject any forced photometry with an uncertainty larger than this,
+        in magnitudes (default: 1.0, which is roughly a S/N of 1). Use 0.36
+        for a 3-sigma cut. Forced photometry includes every epoch, most of
+        which are non-detections with very large errors, so some cut is
+        needed to avoid filling the light curve with noise.
+    reject_negative : bool, optional
+        Reject epochs flagged with isdiffpos = -1, i.e. negative
+        subtractions (default: False). This is off by default because
+        for some objects the real, high signal-to-noise forced photometry
+        is flagged this way, for example when the reference image was
+        built while the transient was bright.
+
+    Returns
+    -------
+    forced_data : astropy.table.Table
+        The forced photometry in an Astropy table format
+    """
+
+    # Empty default table, with the same string format as get_ztf_lightcurve
+    forced_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'],
+                              dtype=['str'] * 9)
+
+    if ztf_name is None:
+        return forced_data
+
+    try:
+        client = Alerce()
+        print(f"Querying Alerce for ZTF forced photometry of {ztf_name} ...")
+        forced = client.query_forced_photometry(ztf_name, format='pandas')
+    except Exception as e:
+        print(f"Error querying ZTF forced photometry: {str(e)}")
+        return forced_data
+
+    # Alerce returns an empty DataFrame if the object has no forced photometry
+    if forced is None or len(forced) == 0:
+        print('No ZTF forced photometry found.')
+        return forced_data
+
+    forced_table = table.Table.from_pandas(forced)
+
+    # Make sure the columns we need are there
+    if ('mjd' not in forced_table.colnames) or ('mag' not in forced_table.colnames):
+        print('ZTF forced photometry is missing the mjd or mag columns.')
+        return forced_data
+
+    # Extract the relevant columns
+    mjd = np.array(forced_table['mjd']).astype(float)
+    mag = np.array(forced_table['mag']).astype(float)
+    if 'e_mag' in forced_table.colnames:
+        mag_err = np.array(forced_table['e_mag']).astype(float)
+    else:
+        mag_err = np.ones(len(forced_table)) * 0.1
+
+    # Only keep sensible measurements
+    good = np.isfinite(mjd) & np.isfinite(mag) & (mag > 0) & (mag < 30)
+
+    # Reject anything with a large uncertainty, these are the epochs where
+    # nothing was detected and the forced photometry is just noise
+    good &= np.isfinite(mag_err) & (mag_err > 0) & (mag_err < max_magerr)
+
+    # Optionally reject negative subtractions, if that column exists
+    if reject_negative and ('isdiffpos' in forced_table.colnames):
+        isdiffpos = np.array([str(i).strip().lower() for i in forced_table['isdiffpos']])
+        good &= ~np.isin(isdiffpos, ['-1', '-1.0', 'f', 'false', '0', 'nan', 'none'])
+
+    if np.sum(good) == 0:
+        print('No useable ZTF forced photometry found.')
+        return forced_data
+
+    # Filter names, fid can be either 1/2/3 or g/r/i
+    filter_map = {'1': 'g', '2': 'r', '3': 'i', '1.0': 'g', '2.0': 'r', '3.0': 'i'}
+    if 'fid' in forced_table.colnames:
+        filters = np.array([filter_map.get(str(f).strip(), str(f).strip()) for f in forced_table['fid']])
+    else:
+        filters = np.array(['--'] * len(forced_table))
+
+    # Coordinates
+    if 'ra' in forced_table.colnames:
+        ra_values = np.array(forced_table['ra']).astype(float)
+    else:
+        ra_values = np.full(len(forced_table), np.nan)
+    if 'dec' in forced_table.colnames:
+        dec_values = np.array(forced_table['dec']).astype(float)
+    else:
+        dec_values = np.full(len(forced_table), np.nan)
+
+    # Create the output table
+    n_good = int(np.sum(good))
+    forced_data = table.Table(data=[mjd[good].astype(str),
+                                    mag[good].astype(str),
+                                    mag_err[good].astype(str),
+                                    np.array(['ZTF'] * n_good),
+                                    filters[good],
+                                    np.array(['Alerce-forced'] * n_good),
+                                    np.array(['False'] * n_good),
+                                    ra_values[good].astype(str),
+                                    dec_values[good].astype(str)],
+                              names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'],
+                              dtype=['str'] * 9)
+
+    print(f'Found {n_good} ZTF forced photometry points')
+    return forced_data
+
+
+def get_rubin_forced(rubin_name, max_magerr=1.0):
+    """
+    Query the Alerce database to get the forced photometry of a Rubin/LSST
+    object. The output has the same format as get_rubin_lightcurve, but the
+    'Source' column is set to 'Alerce-forced' so these points can be told
+    apart from the regular alert photometry.
+
+    Fluxes are converted to AB magnitudes using:
+        mag_AB = -2.5 * log10(flux) + 31.4
+
+    Parameters
+    ----------
+    rubin_name : str
+        The Rubin/LSST object name to query
+    max_magerr : float, optional
+        Reject any forced photometry with an uncertainty larger than this,
+        in magnitudes (default: 1.0, which is roughly a S/N of 1). Use 0.36
+        for a 3-sigma cut.
+
+    Returns
+    -------
+    forced_data : astropy.table.Table
+        The forced photometry in an Astropy table format
+    """
+
+    output_names = ["MJD", "Raw", "MagErr", "Telescope", "Filter", "Source", "UL", "RA", "DEC"]
+    output_dtype = ["float64", "float64", "float64", "str", "str", "str", "str", "float64", "float64"]
+    forced_data = table.Table(names=output_names, dtype=output_dtype)
+
+    if rubin_name is None:
+        return forced_data
+
+    try:
+        client = Alerce()
+        print(f"Querying Alerce for Rubin forced photometry of {rubin_name} ...")
+        forced = client.query_forced_photometry(rubin_name, format="pandas", survey="lsst")
+    except Exception as e:
+        print(f"Error querying Rubin forced photometry: {str(e)}")
+        return forced_data
+
+    if forced is None or len(forced) == 0:
+        print('No Rubin forced photometry found.')
+        return forced_data
+
+    forced_table = table.Table.from_pandas(forced)
+
+    # Make sure the columns we need are there
+    if ('mjd' not in forced_table.colnames) or ('psfFlux' not in forced_table.colnames):
+        print('Rubin forced photometry is missing the mjd or psfFlux columns.')
+        return forced_data
+
+    mjd = np.array(forced_table["mjd"], dtype=float)
+    flux = np.array(forced_table["psfFlux"], dtype=float)
+    if "psfFluxErr" in forced_table.colnames:
+        flux_err = np.array(forced_table["psfFluxErr"], dtype=float)
+    else:
+        flux_err = np.full(len(forced_table), np.nan)
+
+    # Filters
+    if "band_name" in forced_table.colnames:
+        filter_values = np.array(forced_table["band_name"]).astype(str)
+    else:
+        filter_values = np.array(["unknown"] * len(forced_table)).astype(str)
+
+    # Coordinates
+    if "ra" in forced_table.colnames:
+        ra_values = np.array(forced_table["ra"], dtype=float)
+    else:
+        ra_values = np.full(len(forced_table), np.nan, dtype=float)
+    if "dec" in forced_table.colnames:
+        dec_values = np.array(forced_table["dec"], dtype=float)
+    else:
+        dec_values = np.full(len(forced_table), np.nan, dtype=float)
+
+    # Only keep positive fluxes with real errors
+    is_detection = np.isfinite(mjd) & np.isfinite(flux) & (flux > 0.0)
+
+    # Reject low signal-to-noise epochs, most forced photometry is a
+    # non-detection and would otherwise fill the light curve with noise
+    with np.errstate(divide='ignore', invalid='ignore'):
+        all_mag_err = (2.5 / np.log(10.0)) * flux_err / flux
+    is_detection &= np.isfinite(all_mag_err) & (all_mag_err > 0) & (all_mag_err < max_magerr)
+
+    if np.sum(is_detection) == 0:
+        print('No useable Rubin forced photometry found.')
+        return forced_data
+
+    # Convert flux to magnitudes
+    det_mag = -2.5 * np.log10(flux[is_detection]) + 31.4
+    det_mag_err = all_mag_err[is_detection]
+
+    n_good = int(np.sum(is_detection))
+    forced_data = table.Table(data=[mjd[is_detection],
+                                    det_mag,
+                                    det_mag_err,
+                                    np.array(["Rubin"] * n_good),
+                                    filter_values[is_detection],
+                                    np.array(["Alerce-forced"] * n_good),
+                                    np.array(["False"] * n_good),
+                                    ra_values[is_detection],
+                                    dec_values[is_detection]],
+                              names=output_names, dtype=output_dtype)
+
+    print(f'Found {n_good} Rubin forced photometry points')
+    return forced_data
+
+
+def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf', download_ztf=True,
+                       download_forced=False):
     """
     Query the Alerce database to get the light curve of a ZTF object.
 
@@ -311,6 +562,9 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
     download_ztf : bool, optional
         Whether to re-download the ZTF data (default: True)
         If False, it will read the data from a local file.
+    download_forced : bool, optional
+        Whether to also download the forced photometry and append it to
+        the output file with Source = 'Alerce-forced' (default: False)
 
     Returns
     --------
@@ -357,8 +611,10 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
         print(f"Error querying light curve: {str(e)}")
         return ztf_data, ztf_name
 
-    # If we have detections, convert to astropy table and get coordinates
-    if ('detections' in lightcurve) and (not lightcurve.empty):
+    # If we have detections, convert to astropy table and get coordinates.
+    # The length check matters, an empty detections list has no columns to
+    # select and would raise a KeyError in the middle of a batch.
+    if ('detections' in lightcurve) and (not lightcurve.empty) and (len(lightcurve['detections'][0]) > 0):
         # Convert to Astropy table
         det = table.Table(lightcurve['detections'][0])['mjd', 'magpsf', 'sigmapsf', 'fid', 'ra', 'dec']
         if 'non_detections' in lightcurve:
@@ -412,6 +668,15 @@ def get_ztf_lightcurve(object_name, ztf_name=None, save_ztf=True, ztf_dir='ztf',
         if 'comments' not in ztf_data.meta:
             ztf_data.meta['comments'] = []
         ztf_data.meta['comments'].append(f"ztf_name = {ztf_name}")
+
+    # Append forced photometry if requested
+    if download_forced:
+        forced_data = get_ztf_forced(ztf_name)
+        if len(forced_data) > 0:
+            if len(ztf_data) == 0:
+                ztf_data = forced_data
+            else:
+                ztf_data = table.vstack([ztf_data, forced_data])
 
     # Save data to file if requested
     if save_ztf:
@@ -505,7 +770,7 @@ def get_rubin_coords(rubin_name):
 
 
 def get_rubin_lightcurve(object_name, rubin_name=None, save_rubin=True, rubin_dir="rubin",
-                         download_rubin=True, nsigma_ul=3.0):
+                         download_rubin=True, nsigma_ul=3.0, download_forced=False):
     """
     Query ALeRCE to get the LSST light curve of an object. The output will
     be an Astropy Table with the following columns:
@@ -537,6 +802,9 @@ def get_rubin_lightcurve(object_name, rubin_name=None, save_rubin=True, rubin_di
         If False, read from a local file if available.
     nsigma_ul : float, optional, default 3.0
         Sigma threshold used to estimate upper limits from psfFluxErr.
+    download_forced : bool, optional
+        Whether to also download the forced photometry and append it to
+        the output file with Source = 'Alerce-forced' (default: False)
 
     Returns
     -------
@@ -714,6 +982,15 @@ def get_rubin_lightcurve(object_name, rubin_name=None, save_rubin=True, rubin_di
         rubin_data = detections
     elif len(upper_limits) > 0:
         rubin_data = upper_limits
+
+    # Append forced photometry if requested
+    if download_forced:
+        forced_data = get_rubin_forced(rubin_name)
+        if len(forced_data) > 0:
+            if len(rubin_data) == 0:
+                rubin_data = forced_data
+            else:
+                rubin_data = table.vstack([rubin_data, forced_data])
 
     if len(rubin_data) > 0:
         rubin_data.sort("MJD")
@@ -1113,7 +1390,8 @@ def get_local_lightcurve(object_name, local_dir='photometry', read_local=True):
 def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_class_in=None, redshift_in=None,
                        acceptance_radius=3, save_ztf=True, save_rubin=True, download_ztf=True, download_rubin=True,
                        download_osc=False, read_local=True, query_tns=True, ztf_dir='ztf', rubin_dir='rubin',
-                       lc_dir='lightcurves', osc_dir='osc', local_dir='photometry'):
+                       lc_dir='lightcurves', osc_dir='osc', local_dir='photometry', download_forced=False,
+                       read_existing=False):
     '''
     Get the coordinates and name for a transient. Either the coordinates
     and/or the name must be specified. The function will search for missing
@@ -1162,6 +1440,14 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
         Directory where OSC data is stored
     local_dir : str, default 'photometry'
         Directory where local photometry data is stored
+    download_forced : bool
+        Download the ZTF and Rubin forced photometry from Alerce
+        and append it to the light curve files with
+        Source = 'Alerce-forced'?
+    read_existing : bool
+        Is the combined light curve going to be read from lc_dir? If it is,
+        and that file exists, ZTF and Rubin are not queried at all, because
+        their photometry would only be discarded.
 
     Returns
     -------
@@ -1204,6 +1490,10 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
     local_data = table.Table(names=['MJD', 'Raw', 'MagErr', 'Telescope', 'Filter', 'Source', 'UL', 'RA', 'DEC'])
     ztf_name = None
     rubin_name = None
+    # Track whether the name searches already ran, so objects with no
+    # counterpart are not queried twice
+    ztf_searched = False
+    rubin_searched = False
     tns_name = None
     object_class = None
     redshift = None
@@ -1218,6 +1508,13 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
             clean_object_name_in = clean_object_name_in[2:]
         if clean_object_name_in.startswith('SN'):
             clean_object_name_in = clean_object_name_in[2:]
+
+    # If the combined light curve is going to be read from disk, there is no
+    # reason to query ZTF or Rubin for photometry that would be discarded
+    if read_existing and clean_object_name_in is not None:
+        if os.path.exists(os.path.join(lc_dir, f'{clean_object_name_in}.txt')):
+            download_ztf = False
+            download_rubin = False
 
     if not download_ztf and clean_object_name_in is not None:
         ztf_local_files = [
@@ -1263,9 +1560,11 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
 
             if download_ztf:
                 ztf_name = get_ztf_name(ra_deg, dec_deg, acceptance_radius)
+                ztf_searched = True
 
             if download_rubin:
                 rubin_name = get_rubin_name(ra_deg, dec_deg, acceptance_radius)
+                rubin_searched = True
 
             # Explicit user inputs should override queried class/redshift values
             if object_class_in is not None:
@@ -1335,10 +1634,12 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
             # Get ZTF name
             if download_ztf:
                 ztf_name = get_ztf_name(ra_deg, dec_deg, acceptance_radius)
+                ztf_searched = True
             
             # Get Rubin name
             if download_rubin:
                 rubin_name = get_rubin_name(ra_deg, dec_deg, acceptance_radius)
+                rubin_searched = True
 
     # Explicit user inputs should always be preserved, including for ZTF,
     # Rubin, and local/other objects.
@@ -1351,20 +1652,22 @@ def get_transient_info(object_name_in=None, ra_in=None, dec_in=None, object_clas
     # This lets ZTF-named objects pick up Rubin light curves and Rubin-named
     # objects pick up ZTF light curves when both are available.
     if ra_deg is not None and dec_deg is not None:
-        if download_ztf and ztf_name is None:
+        if download_ztf and ztf_name is None and not ztf_searched:
             ztf_name = get_ztf_name(ra_deg, dec_deg, acceptance_radius)
-        if download_rubin and rubin_name is None:
+        if download_rubin and rubin_name is None and not rubin_searched:
             rubin_name = get_rubin_name(ra_deg, dec_deg, acceptance_radius)
 
     # Query light curves from ZTF
-    ztf_data, ztf_name = get_ztf_lightcurve(object_name, ztf_name, save_ztf=save_ztf, ztf_dir=ztf_dir, download_ztf=download_ztf)
+    ztf_data, ztf_name = get_ztf_lightcurve(object_name, ztf_name, save_ztf=save_ztf, ztf_dir=ztf_dir, download_ztf=download_ztf,
+                                            download_forced=download_forced)
 
     # Query light curves from OSC
     osc_data = get_osc_lightcurve(object_name, ra_deg, dec_deg, osc_dir=osc_dir, download_osc=download_osc)
 
     # Query light curves from Rubin/LSST
     rubin_data, rubin_name = get_rubin_lightcurve(object_name, rubin_name, save_rubin=save_rubin,
-                                                  rubin_dir=rubin_dir, download_rubin=download_rubin)
+                                                  rubin_dir=rubin_dir, download_rubin=download_rubin,
+                                                  download_forced=download_forced)
 
     # Query local data
     if read_local:
@@ -1483,7 +1786,7 @@ def query_dust(ra_deg, dec_deg, dust_map='SFD'):
 
 def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, rubin_data=None, osc_data=None,
                        local_data=None, save_lc=True, lc_dir='lightcurves', read_existing=False,
-                       clean_ignore=True, dust_map='SFD'):
+                       clean_ignore=True, dust_map='SFD', include_forced=False):
     """
     Gather all the available photometry and merge it into one astropy table.
 
@@ -1513,6 +1816,11 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
         Whether to ignore data based on the ignore file (default: True).
     dust_map : str, default: 'SFD'
         Dust map to use for reddening correction ('SF', 'SFD', or 'none').
+    include_forced : bool
+        Use the forced photometry (Source = 'Alerce-forced') in the
+        returned light curve? The forced photometry is always kept in
+        the saved file, but it is only used by FLEET if this is True.
+        (default: False)
 
     Returns
     -------
@@ -1522,6 +1830,7 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
 
     # Read existing data if requested
     output_file = os.path.join(lc_dir, f'{object_name}.txt')
+
     # Check if the file exists
     if os.path.exists(output_file) and read_existing:
         print('\nReading existing light curve data ...')
@@ -1535,6 +1844,10 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
         # curves are not stuck with stale or generic wavelength assignments.
         if len(input_table) > 0 and 'Filter' in input_table.colnames:
             input_table['Cenwave'] = get_table_cenwaves(input_table)
+
+        # Remove the forced photometry unless it was requested
+        if not include_forced:
+            input_table = remove_forced(input_table)
 
         return input_table
     else:
@@ -1574,23 +1887,29 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
         if col not in local_data.colnames:
             local_data[col] = table.Column([np.nan] * len(local_data), name=col, dtype='float64')
 
-    # Copy the types from ztf_data into the other two tables
-    if len(ztf_data) > 0:
-        rubin_data = table.Table(rubin_data, names=ztf_data.colnames, dtype=ztf_data.dtype)
-        osc_data = table.Table(osc_data, names=ztf_data.colnames, dtype=ztf_data.dtype)
-        local_data = table.Table(local_data, names=ztf_data.colnames, dtype=ztf_data.dtype)
-
-    # Combine all data into one table
-    input_table = table.vstack([ztf_data, rubin_data, osc_data, local_data])
+    # Normalize each input independently, then let vstack promote string
+    # columns to the widest value present. Casting everything to the ZTF dtype
+    # truncated longer labels such as Telescope='Rubin' and
+    # Source='Alerce-forced'. Normalizing first also gives empty tables the
+    # correct numeric/string schema.
+    lightcurve_dtype = [
+        'float64', 'float64', 'float64', 'str', 'str', 'str', 'str',
+        'float64', 'float64', 'str'
+    ]
+    lightcurve_tables = [
+        table.Table(data[colnames], names=colnames, dtype=lightcurve_dtype)
+        for data in (ztf_data, rubin_data, osc_data, local_data)
+    ]
+    input_table = table.vstack(lightcurve_tables)
 
     # If there is no data, return an empty table
     if len(input_table) == 0:
         print("No data found for the specified object.")
         return input_table
 
-    # Assigning types: float, float, float, str, str, str, str, float, float, str
+    # Retain the normalized schema after stacking.
     input_table = table.Table(input_table[colnames], names=colnames,
-                              dtype=['float64', 'float64', 'float64', 'str', 'str', 'str', 'str', 'float64', 'float64', 'str'])
+                              dtype=lightcurve_dtype)
 
     # Make sure all values in UL are either True or False, if they are in this list set it to True
     limit_list = [True, -1.0, 'True', '-1', '-1.0', '-1.', b'True', b'-1', b'-1.0', b'-1.', 'T']
@@ -1629,5 +1948,10 @@ def process_lightcurve(object_name, ra_deg=None, dec_deg=None, ztf_data=None, ru
         os.makedirs(lc_dir, exist_ok=True)
         # Save the data to a file
         input_table.write(output_file, format='ascii', overwrite=True)
+
+    # Remove the forced photometry unless it was requested. This is done after
+    # saving, so the forced photometry is always kept in the output file.
+    if not include_forced:
+        input_table = remove_forced(input_table)
 
     return input_table
