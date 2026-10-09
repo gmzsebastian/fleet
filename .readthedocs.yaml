@@ -7,11 +7,11 @@ sphinx:
 
 # Specify build configuration
 build:
-  os: ubuntu-20.04
+  os: ubuntu-24.04
   apt_packages:
     - graphviz
   tools:
-    python: "3.9"
+    python: "3.11"
 
 # Set the version of Python and requirements required to build docs
 python:
@@ -19,5 +19,3 @@ python:
     - requirements: docs/rtd-pip-requirements
     - method: pip
       path: .
-      extra_requirements:
-        - docs
