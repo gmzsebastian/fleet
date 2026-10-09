@@ -6,11 +6,11 @@
 
 import os
 import sys
-from pkg_resources import DistributionNotFound, get_distribution
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 try:
-    __version__ = get_distribution("fleet").version
-except DistributionNotFound:
+    __version__ = _pkg_version("fleet_pipe")
+except PackageNotFoundError:
     __version__ = "unknown version"
 
 # -- Path setup --------------------------------------------------------------
