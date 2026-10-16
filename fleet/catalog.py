@@ -2237,8 +2237,10 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 correction = -2.5 * np.log10(ext.extinguish(cenwaves, Ebv=E_BV))
 
-            data_catalog[f'{band}PSFMag_3pi'] -= correction
-            data_catalog[f'{band}KronMag_3pi'] -= correction
+            # Cast to float: an empty/all-integer magnitude column is int64, and
+            # numpy 2.x refuses the in-place int -= float extinction correction.
+            for col in (f'{band}PSFMag_3pi', f'{band}KronMag_3pi'):
+                data_catalog[col] = data_catalog[col].astype(float) - correction
 
     if 'psfMag_g_sdss' in data_catalog.colnames:
         for band in bands_sdss:
@@ -2247,8 +2249,8 @@ def catalog_operations(object_name, merged_catalog, ra_deg, dec_deg, Pcc_filter=
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 correction = -2.5 * np.log10(ext.extinguish(cenwaves, Ebv=E_BV))
 
-            data_catalog[f'psfMag_{band}_sdss'] -= correction
-            data_catalog[f'modelMag_{band}_sdss'] -= correction
+            for col in (f'psfMag_{band}_sdss', f'modelMag_{band}_sdss'):
+                data_catalog[col] = data_catalog[col].astype(float) - correction
 
     # Calculate the nature of the objects
     if recalculate_nature or 'object_nature' not in data_catalog.colnames:
